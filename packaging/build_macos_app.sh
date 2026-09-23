@@ -32,9 +32,12 @@ rm -rf "$ROOT_DIR/build" "$ROOT_DIR/dist"
 
 ARCH="$(uname -m)"
 ZIP_PATH="$ROOT_DIR/dist/Mirror-Screen-macos-$ARCH.zip"
+CHECKSUM_PATH="$ROOT_DIR/dist/SHA256SUMS.txt"
 rm -f "$ZIP_PATH"
 ditto -c -k --sequesterRsrc --keepParent \
     "$ROOT_DIR/dist/Mirror Screen.app" "$ZIP_PATH"
+shasum -a 256 "$ZIP_PATH" > "$CHECKSUM_PATH"
 
 print "Created: $ROOT_DIR/dist/Mirror Screen.app"
 print "Created: $ZIP_PATH"
+print "Created: $CHECKSUM_PATH"

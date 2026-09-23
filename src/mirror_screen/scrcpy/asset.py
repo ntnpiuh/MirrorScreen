@@ -6,6 +6,7 @@ to start otherwise), so the version is pinned here rather than discovered.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import urllib.error
 import urllib.request
@@ -34,6 +35,7 @@ _RELEASE_URL = (
 #: Sanity limits on the downloaded asset size.
 _MIN_JAR_BYTES = 50_000
 _MAX_JAR_BYTES = 4_000_000
+_SERVER_SHA256 = "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae"
 
 ProgressFn = Callable[[str], None]
 
@@ -81,6 +83,13 @@ def ensure_server_jar(
             "the release URL may have changed"
         )
 
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != _SERVER_SHA256:
+        tmp.unlink(missing_ok=True)
+        raise ServerError(
+            "downloaded server jar failed SHA-256 verification; refusing to use it"
+        )
+
     tmp.write_bytes(payload)
     tmp.replace(jar)
     report(f"  cached at {jar}")
@@ -92,4 +101,10 @@ def _looks_valid(jar: Path) -> bool:
         size = jar.stat().st_size
     except OSError:
         return False
-    return _MIN_JAR_BYTES <= size <= _MAX_JAR_BYTES
+    if not _MIN_JAR_BYTES <= size <= _MAX_JAR_BYTES:
+        return False
+    try:
+        digest = hashlib.sha256(jar.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return digest == _SERVER_SHA256

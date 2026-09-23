@@ -81,9 +81,11 @@ To create one self-contained app that can be opened by double-clicking:
 ```
 
 This creates `dist/Mirror Screen.app` and a shareable
-`dist/Mirror-Screen-macos-arm64.zip`. Open the app bundle to show the latency
-settings UI before connecting to the phone. The first run may still download
-`adb` and the pinned scrcpy server into the user's cache.
+`dist/Mirror-Screen-macos-arm64.zip`, plus `dist/SHA256SUMS.txt`. Verify the zip
+before opening it with `shasum -a 256 -c dist/SHA256SUMS.txt`. Open the app
+bundle to show the latency settings UI before connecting to the phone. The
+first run may still download `adb` and the pinned scrcpy server into the user's
+cache.
 
 From a terminal, the equivalent is:
 

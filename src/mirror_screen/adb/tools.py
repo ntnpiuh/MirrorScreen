@@ -173,6 +173,11 @@ def _unzip_adb(archive: Path, destination: Path, progress: ProgressFn | None) ->
     destination.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(archive) as zf:
+        root = destination.resolve()
+        for member in zf.infolist():
+            target = (destination / member.filename).resolve()
+            if target != root and root not in target.parents:
+                raise AdbError(f"refusing unsafe archive path: {member.filename!r}")
         zf.extractall(destination)
 
     extracted = destination / "platform-tools"
@@ -190,15 +195,6 @@ def _unzip_adb(archive: Path, destination: Path, progress: ProgressFn | None) ->
     for entry in extracted.iterdir():
         if entry.is_file():
             entry.chmod(entry.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
-
-    if platform.system() == "Darwin":
-        # urllib does not set the quarantine attribute, but strip it anyway so
-        # a manually placed copy keeps working.
-        subprocess.run(
-            ["xattr", "-dr", "com.apple.quarantine", str(extracted)],
-            check=False,
-            capture_output=True,
-        )
 
     return adb
 
