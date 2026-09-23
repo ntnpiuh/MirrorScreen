@@ -42,6 +42,24 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--force", action="store_true", help="re-download the server")
     setup.set_defaults(func=_cmd_setup)
 
+    ui = subparsers.add_parser(
+        "ui",
+        help="open the pre-mirror settings panel to tune latency",
+    )
+    _add_common_options(ui)
+    ui.add_argument(
+        "--link-quality",
+        choices=["fast", "balanced", "weak", "very_weak"],
+        default="balanced",
+        help="preset for USB/link quality and stream tuning",
+    )
+    ui.add_argument("--max-size", type=int, default=0, help="cap the largest dimension")
+    ui.add_argument("--bit-rate", type=int, default=DEFAULT_VIDEO_BIT_RATE, help="target bit rate")
+    ui.add_argument("--max-fps", type=float, default=60.0, help="frame-rate cap")
+    ui.add_argument("--no-vsync", action="store_true", help="disable vsync")
+    ui.add_argument("--render-thread", action="store_true", help="prefer a dedicated render thread")
+    ui.set_defaults(func=_cmd_ui)
+
     probe = subparsers.add_parser(
         "probe",
         help="decode from a real device for a few seconds and report",
@@ -246,6 +264,11 @@ def _add_window_options(parser: argparse.ArgumentParser) -> None:
         default=1.0,
         help="scroll amount per wheel notch; use a negative value to flip it",
     )
+    window.add_argument(
+        "--render-thread",
+        action="store_true",
+        help="prefer a dedicated rendering thread when available",
+    )
 
 
 def _config_from_args(args: argparse.Namespace) -> SessionConfig:
@@ -258,14 +281,14 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         key, _, value = item.partition(":")
         codec_options.append((key.strip(), value.strip()))
 
-    return SessionConfig(
+    config = SessionConfig(
         serial=args.serial,
         adb_path=args.adb,
         cache_dir=args.cache_dir,
         max_size=args.max_size,
         max_fps=args.max_fps,
         video_bit_rate=args.bit_rate,
-        video_codec=args.codec,
+        video_codec=getattr(args, "codec", "h264"),
         video_codec_options=codec_options,
         audio=getattr(args, "audio", False),
         control=not getattr(args, "no_control", False),
@@ -280,6 +303,8 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         scale=getattr(args, "scale", 1.0),
         integer_scale=getattr(args, "integer_scale", False),
         filter_mode="nearest" if getattr(args, "nearest", False) else "linear",
+        render_thread=getattr(args, "render_thread", False),
+        link_quality=getattr(args, "link_quality", None),
         vsync=not getattr(args, "no_vsync", False),
         show_stats=not getattr(args, "no_stats", False),
         auto_resize_window=not getattr(args, "no_auto_resize", False),
@@ -289,6 +314,10 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         color_range=getattr(args, "color_range", "auto"),
         scroll_scale=getattr(args, "scroll_scale", 1.0),
     )
+    link_quality = getattr(args, "link_quality", None)
+    if getattr(args, "command", None) == "ui" and link_quality:
+        config.apply_link_quality()
+    return config
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -297,6 +326,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     config.validate()
     return run(config, progress=lambda message: print(message, file=sys.stderr))
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    from .app import run
+    from .ui.settings import run_pre_mirror_settings
+
+    config = _config_from_args(args)
+    config.validate()
+    selected = run_pre_mirror_settings(config)
+    if selected is None:
+        return 0
+    return run(selected, progress=lambda message: print(message, file=sys.stderr))
 
 
 def _cmd_devices(args: argparse.Namespace) -> int:

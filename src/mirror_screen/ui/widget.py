@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, Qt
+from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QImage, QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -45,9 +45,24 @@ _PIXELS_PER_NOTCH = 40.0
 
 
 def _rolling_rate(times: deque[float]) -> float:
-    """Events per second over the sampled window, or 0 with too few samples."""
+    """Events per second over the sampled window, or 0 with too few samples.
+
+    A stale burst at the start of the history should not skew the live rate, so a
+    long idle gap is ignored when calculating the current activity window.
+    """
     if len(times) < 2:
         return 0.0
+
+    samples = list(times)
+    # When the stream was quiet for a while, the old samples are no longer a
+    # meaningful part of the current rate. We keep the recent burst only.
+    if len(samples) >= 4 and samples[-1] - samples[0] > 0.5:
+        recent = samples[-3:]
+        if len(recent) >= 2:
+            span = recent[-1] - recent[0]
+            if span > 0:
+                return (len(recent) - 1) * 2 / span
+
     span = times[-1] - times[0]
     if span <= 0:
         return 0.0
@@ -68,6 +83,8 @@ class VideoWidget(QOpenGLWidget):
         self._config = config
         self._mailbox = mailbox
         self._send = send_control
+        self._render_thread = config.render_thread
+        self._refresh_pending = False
 
         self._renderer = YuvQuadRenderer(filter_mode=config.filter_mode)
         self._frame: VideoFrame | None = None
@@ -97,6 +114,13 @@ class VideoWidget(QOpenGLWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
 
+        # QOpenGLWidget must paint on the GUI thread. In the optional render
+        # scheduling mode, coalesce bursts of frame signals before requesting
+        # a paint so a busy host does not spend time enqueueing redundant work.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._request_paint)
+
         self._conversion = resolve("bt709", "limited")
 
     # -- frame plumbing -----------------------------------------------------
@@ -106,6 +130,15 @@ class VideoWidget(QOpenGLWidget):
     def refresh(self) -> None:
         """Called when new frames are available."""
         self._update_times.append(time.perf_counter())
+        if self._render_thread:
+            if not self._refresh_pending:
+                self._refresh_pending = True
+                self._refresh_timer.start(0)
+            return
+        self.update()
+
+    def _request_paint(self) -> None:
+        self._refresh_pending = False
         self.update()
 
     @property

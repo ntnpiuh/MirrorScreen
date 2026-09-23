@@ -71,6 +71,20 @@ window or pass options to it:
 ./"Mirror Screen.command" --max-size 1280 --no-vsync
 ```
 
+### macOS app bundle
+
+To create one self-contained app that can be opened by double-clicking:
+
+```bash
+.venv/bin/pip install pyinstaller
+./packaging/build_macos_app.sh
+```
+
+This creates `dist/Mirror Screen.app` and a shareable
+`dist/Mirror-Screen-macos-arm64.zip`. Open the app bundle to show the latency
+settings UI before connecting to the phone. The first run may still download
+`adb` and the pinned scrcpy server into the user's cache.
+
 From a terminal, the equivalent is:
 
 ```bash
@@ -154,6 +168,18 @@ is why they can be trusted:
   become the bottleneck and delay will start to accumulate.
 
 ### Diagnosing stutter
+
+For a small pre-mirror settings panel, run:
+
+```bash
+mirror-screen ui
+```
+
+It applies the selected USB/link preset, stream size, frame-rate cap, bit rate,
+vsync, and render scheduling preference before starting the mirror session.
+`render scheduling` coalesces repaint requests on the Qt GUI thread; Qt requires
+`QOpenGLWidget` rendering to stay on that thread. Decode and stream handling
+already run on worker threads.
 
 Run with `--trace` to log the status line every 2 s. The numbers are chosen so
 they say *where* a problem is, rather than leaving you to guess:

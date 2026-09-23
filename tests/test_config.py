@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mirror_screen.cli import build_parser, main
+from mirror_screen.cli import _config_from_args, build_parser, main
 from mirror_screen.config import SessionConfig
 
 
@@ -65,6 +65,17 @@ def test_cli_defaults_to_the_run_command():
     assert args.max_size == 0
 
 
+def test_ui_command_is_registered_and_defaults_are_valid():
+    parser = build_parser()
+    args = parser.parse_args(["ui"])
+    assert args.func is not None
+    config = _config_from_args(args)
+    config.validate()
+    assert config.vsync is True
+    assert config.render_thread is False
+    assert config.link_quality in {"fast", "balanced", "weak", "very_weak"}
+
+
 def test_cli_translates_flags_into_configuration():
     from mirror_screen.cli import _config_from_args
 
@@ -99,6 +110,18 @@ def test_cli_translates_flags_into_configuration():
     assert config.scale == 2.0
     assert config.video_codec_options == [("profile", "1")]
     assert config.serial == "ABC123"
+
+
+def test_link_quality_maps_to_bandwidth_and_resolution():
+    config = SessionConfig(link_quality="weak")
+    config.apply_link_quality()
+    assert config.max_size == 1280
+    assert config.video_bit_rate == 8_000_000
+
+    config = SessionConfig(link_quality="fast")
+    config.apply_link_quality()
+    assert config.max_size == 0
+    assert config.video_bit_rate == 40_000_000
 
 
 def test_cli_rejects_a_malformed_codec_option():

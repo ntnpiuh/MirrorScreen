@@ -17,6 +17,13 @@ from .protocol.const import VIDEO_CODECS
 #: without starving the encoder.
 DEFAULT_VIDEO_BIT_RATE = 24_000_000
 
+LINK_QUALITY_PRESETS = {
+    "fast": {"max_size": 0, "video_bit_rate": 40_000_000, "max_fps": 60.0},
+    "balanced": {"max_size": 1440, "video_bit_rate": 24_000_000, "max_fps": 60.0},
+    "weak": {"max_size": 1280, "video_bit_rate": 8_000_000, "max_fps": 60.0},
+    "very_weak": {"max_size": 720, "video_bit_rate": 4_000_000, "max_fps": 30.0},
+}
+
 _CODEC_OPTION_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
@@ -75,9 +82,27 @@ class SessionConfig:
     auto_resize_window: bool = True
     """Reshape the window to the video when the device rotates. Turned off
     automatically once the window is resized by hand."""
+    render_thread: bool = False
+    """Render on a dedicated worker when the host is slow or the window is
+    busy; this is a pre-mirror tuning toggle for a lower-latency UI profile."""
+    link_quality: str | None = "balanced"
+    """Optional preset for the host USB / display quality. Valid values are
+    ``fast``, ``balanced``, ``weak``, and ``very_weak`` when set."""
     vsync: bool = True
     """Wait for the display refresh between frames. Disabling it removes up to
     one refresh interval of latency at the cost of possible tearing."""
+
+    def apply_link_quality(self) -> None:
+        """Apply a preset target for stream size and bitrate based on USB/link quality."""
+        if self.link_quality not in LINK_QUALITY_PRESETS:
+            raise ValueError(
+                f"unsupported link quality: {self.link_quality!r} "
+                "(known: fast, balanced, weak, very_weak)"
+            )
+        preset = LINK_QUALITY_PRESETS[self.link_quality]
+        self.max_size = preset["max_size"]
+        self.video_bit_rate = preset["video_bit_rate"]
+        self.max_fps = preset["max_fps"]
 
     def validate(self) -> None:
         """Raise :class:`ValueError` if the configuration is not usable."""
@@ -104,6 +129,16 @@ class SessionConfig:
             raise ValueError("scroll_scale must not be zero")
         if self.filter_mode not in {"linear", "nearest"}:
             raise ValueError(f"unsupported filter mode: {self.filter_mode!r}")
+        if self.link_quality is not None and self.link_quality not in {
+            "fast",
+            "balanced",
+            "weak",
+            "very_weak",
+        }:
+            raise ValueError(
+                f"unsupported link quality: {self.link_quality!r} "
+                "(known: fast, balanced, weak, very_weak)"
+            )
         if self.color_matrix not in {"auto", "bt601", "bt709"}:
             raise ValueError(f"unsupported color matrix: {self.color_matrix!r}")
         if self.color_range not in {"auto", "limited", "full"}:
