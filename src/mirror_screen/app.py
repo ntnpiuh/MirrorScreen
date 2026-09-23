@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
+from collections.abc import Iterator
+from itertools import chain, repeat
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -14,25 +17,28 @@ from PySide6.QtWidgets import QApplication
 from .adb import Adb, cache_root, ensure_adb
 from .config import SessionConfig
 from .control_channel import ControlChannel
+from .errors import MirrorScreenError
 from .scrcpy import ScrcpyServer, ServerSession, ensure_server_jar
 from .ui.widget import VideoWidget
 from .ui.window import MirrorWindow
-from .video.pipeline import FrameMailbox, PipelineCallbacks, VideoPipeline
+from .video.pipeline import FrameMailbox, PipelineCallbacks, PipelineStats, VideoPipeline
 
 log = logging.getLogger(__name__)
 
 _DEFAULT_WINDOW = (1280, 720)
 
+#: Delay before each reconnection attempt, in seconds. The last value repeats
+#: for as long as the window stays open.
+_RECONNECT_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
 
-class UiBridge(QObject):
-    """Marshals worker-thread events onto the GUI thread."""
+#: Statistics are sampled every 500 ms; log every fourth sample when tracing.
+_STATUS_INTERVAL_MS = 500
+_TRACE_EVERY = 4
 
-    frame_ready = Signal()
-    session_changed = Signal(int, int)
-    pipeline_ended = Signal(str)
-    pipeline_failed = Signal(str)
-    clipboard_received = Signal(str)
-    ack_received = Signal(int)
+
+def reconnect_delays() -> Iterator[float]:
+    """Delays between reconnection attempts, then the longest one forever."""
+    return chain(_RECONNECT_DELAYS, repeat(_RECONNECT_DELAYS[-1]))
 
 
 def configure_surface_format(*, vsync: bool = True) -> None:
@@ -49,12 +55,209 @@ def configure_surface_format(*, vsync: bool = True) -> None:
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
-def start_device_session(
-    config: SessionConfig,
-    *,
-    progress=None,
-) -> tuple[ScrcpyServer, ServerSession]:
-    """Resolve adb, fetch the server jar and start the on-device server."""
+class SessionRunner(QObject):
+    """Owns the device session and keeps it alive across disconnects.
+
+    Starting a session means adb work (push the server, set up the tunnel,
+    launch the process), after which the pipeline owns the video socket. When
+    the stream ends — the phone slept, the cable moved, the server exited — the
+    runner tears the session down and rebuilds it, so the window recovers by
+    itself instead of freezing on the last frame with no explanation.
+
+    Signals are emitted from the supervisor thread; Qt queues them onto the GUI
+    thread for us.
+    """
+
+    stream_state = Signal(str)
+    """Text for the overlay over the video; an empty string hides it."""
+
+    stream_message = Signal(str)
+    """One-off message for the status bar."""
+
+    device_ready = Signal(str)
+    """Emitted with the device name once a session is up."""
+
+    frame_ready = Signal()
+    session_changed = Signal(int, int)
+    clipboard_received = Signal(str)
+
+    def __init__(
+        self,
+        config: SessionConfig,
+        mailbox: FrameMailbox,
+        *,
+        adb_path: Path,
+        jar: Path,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._mailbox = mailbox
+        self._adb_path = adb_path
+        self._jar = jar
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._server: ScrcpyServer | None = None
+        self._pipeline: VideoPipeline | None = None
+        self._channel: ControlChannel | None = None
+        self._device_name = ""
+
+    # -- public API, called from the GUI thread ----------------------------
+    def start(self) -> None:
+        """Connect once, raising if that fails, then keep the session alive."""
+        self._open_session()  # a first failure reaches the command line
+        self._thread = threading.Thread(
+            target=self._supervise, name="session-supervisor", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Shut the session down and stop supervising."""
+        self._stop.set()
+        self._teardown()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+
+    @property
+    def device_name(self) -> str:
+        return self._device_name
+
+    def stats(self) -> PipelineStats | None:
+        """Live counters, or ``None`` when no stream is running."""
+        with self._lock:
+            pipeline = self._pipeline
+        return pipeline.stats if pipeline is not None else None
+
+    def seconds_since_last_frame(self) -> float:
+        with self._lock:
+            pipeline = self._pipeline
+        return pipeline.seconds_since_last_frame() if pipeline is not None else 0.0
+
+    # -- device commands (the MirrorWindow's DeviceCommands interface) ------
+    def send_control(self, payload: bytes) -> None:
+        self._with_channel(lambda channel: channel.send(payload))
+
+    def rotate_device(self) -> None:
+        self._with_channel(lambda channel: channel.rotate_device())
+
+    def set_display_power(self, on: bool) -> None:
+        self._with_channel(lambda channel: channel.set_display_power(on))
+
+    def set_clipboard(self, text: str, *, paste: bool = False) -> None:
+        self._with_channel(lambda channel: channel.set_clipboard(text, paste=paste))
+
+    def _with_channel(self, action) -> None:
+        with self._lock:
+            channel = self._channel
+        if channel is not None:
+            action(channel)
+
+    # -- session lifecycle -------------------------------------------------
+    def _open_session(self) -> None:
+        """Start the server and the pipeline. Raises on failure."""
+        config = self._config
+        adb = Adb(self._adb_path, config.serial)
+        server = ScrcpyServer(adb, self._jar, config)
+        session = server.start()
+        self._server = server
+        self._device_name = session.device_name
+
+        channel: ControlChannel | None = None
+        if session.control is not None:
+            channel = ControlChannel(
+                session.control,
+                on_clipboard=self.clipboard_received.emit,
+            )
+            channel.start()
+
+        pipeline = VideoPipeline(
+            session.video,
+            config,
+            self._mailbox,
+            PipelineCallbacks(
+                on_frame=lambda _frame: self.frame_ready.emit(),
+                on_session=lambda packet: self.session_changed.emit(
+                    packet.width, packet.height
+                ),
+                # The supervisor thread reports the end; the pipeline callbacks
+                # only need to surface the wording.
+                on_end=lambda reason: self.stream_message.emit(reason),
+                on_error=lambda exc: self.stream_message.emit(str(exc)),
+            ),
+        )
+
+        with self._lock:
+            self._channel = channel
+            self._pipeline = pipeline
+        pipeline.start()
+
+        log.info("session up: %s", session.device_name)
+        self.device_ready.emit(session.device_name)
+        self.stream_state.emit("")
+
+    def _teardown(self) -> None:
+        with self._lock:
+            pipeline, channel, server = self._pipeline, self._channel, self._server
+            self._pipeline = None
+            self._channel = None
+            self._server = None
+
+        if pipeline is not None:
+            pipeline.stop()  # also unblocks the supervisor's join()
+        if channel is not None:
+            channel.stop()
+        if server is not None:
+            server.stop()
+
+    def _supervise(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                pipeline = self._pipeline
+            if pipeline is None:
+                return
+            pipeline.join()  # returns when the stream ends or we are stopping
+            if self._stop.is_set():
+                return
+
+            self._teardown()
+            if not self._config.auto_reconnect:
+                self.stream_state.emit("stream ended")
+                return
+
+            if self._reconnect():
+                continue
+            return
+
+    def _reconnect(self) -> bool:
+        """Keep trying to rebuild the session. False means we are stopping."""
+        for delay in reconnect_delays():
+            self.stream_state.emit("stream stopped - reconnecting")
+            if self._stop.wait(delay):
+                return False
+            try:
+                self._open_session()
+            except MirrorScreenError as exc:
+                log.info("reconnect failed: %s", exc)
+                self.stream_state.emit(
+                    "disconnected - waiting for the device\n"
+                    "check the cable, and that USB debugging is still enabled"
+                )
+                continue
+            except Exception:  # pragma: no cover - defensive
+                log.exception("unexpected failure while reconnecting")
+                continue
+
+            self.stream_message.emit(f"reconnected to {self._device_name}")
+            return True
+
+        return False  # pragma: no cover - reconnect_delays() never ends
+
+
+def run(config: SessionConfig, *, progress=None) -> int:
+    """Run a full mirroring session; returns a process exit code."""
     config.validate()
     progress = progress or (lambda message: print(message, file=sys.stderr))
 
@@ -64,69 +267,60 @@ def start_device_session(
     cache = Path(config.cache_dir) if config.cache_dir else cache_root()
     jar = ensure_server_jar(cache, progress=progress)
 
+    return _run_gui(config, adb_path, jar)
+
+
+def start_device_session(
+    config: SessionConfig, *, progress=None
+) -> tuple[ScrcpyServer, ServerSession]:
+    """Connect once and hand back the server and its session.
+
+    For one-shot, non-GUI use (the probe and the self-check). The window uses
+    :class:`SessionRunner` instead, which needs the resolved adb path and jar so
+    it can rebuild the session without resolving them again.
+    """
+    config.validate()
+    progress = progress or (lambda message: print(message, file=sys.stderr))
+
+    adb_path = ensure_adb(config.adb_path, progress=progress)
+    cache = Path(config.cache_dir) if config.cache_dir else cache_root()
+    jar = ensure_server_jar(cache, progress=progress)
+
     adb = Adb(adb_path, config.serial)
     server = ScrcpyServer(adb, jar, config)
     return server, server.start()
 
 
-def run(config: SessionConfig, *, progress=None) -> int:
-    """Run a full mirroring session; returns a process exit code."""
-    server, session = start_device_session(config, progress=progress)
-    try:
-        return _run_gui(config, session)
-    finally:
-        server.stop()
-
-
-def _run_gui(config: SessionConfig, session: ServerSession) -> int:
+def _run_gui(config: SessionConfig, adb_path: Path, jar: Path) -> int:
     configure_surface_format(vsync=config.vsync)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("Mirror Screen")
     app.setApplicationDisplayName("Mirror Screen")
 
     mailbox = FrameMailbox()
-    bridge = UiBridge()
+    runner = SessionRunner(config, mailbox, adb_path=adb_path, jar=jar)
 
-    channel: ControlChannel | None = None
-    if session.control is not None:
-        channel = ControlChannel(
-            session.control,
-            on_clipboard=bridge.clipboard_received.emit,
-            on_ack=bridge.ack_received.emit,
-        )
-        channel.start()
+    try:
+        runner.start()
+    except MirrorScreenError as exc:
+        # Nothing to show yet, so report it the way a command line tool should.
+        raise MirrorScreenError(str(exc)) from exc
 
-    send_control = channel.send if channel is not None else _discard
-    widget = VideoWidget(config, mailbox, send_control)
-
-    pipeline = VideoPipeline(
-        session.video,
-        config,
-        mailbox,
-        PipelineCallbacks(
-            on_frame=lambda _frame: bridge.frame_ready.emit(),
-            on_session=lambda packet: bridge.session_changed.emit(
-                packet.width, packet.height
-            ),
-            on_end=bridge.pipeline_ended.emit,
-            on_error=lambda exc: bridge.pipeline_failed.emit(str(exc)),
-        ),
-    )
-
+    widget = VideoWidget(config, mailbox, runner.send_control)
     window = MirrorWindow(
         widget,
         config,
-        device_name=session.device_name,
-        channel=channel,
-        stats_provider=lambda: _status_text(pipeline, mailbox, config),
+        device_name=runner.device_name,
+        commands=runner,
+        stats_provider=lambda: _status_text(runner, mailbox, config, widget),
     )
 
-    bridge.frame_ready.connect(widget.refresh)
-    bridge.session_changed.connect(widget.set_video_size)
-    bridge.session_changed.connect(window.on_video_session)
-    bridge.pipeline_ended.connect(window.show_pipeline_end)
-    bridge.pipeline_failed.connect(window.show_pipeline_error)
-    bridge.clipboard_received.connect(window.set_clipboard_from_device)
+    runner.frame_ready.connect(widget.refresh)
+    runner.session_changed.connect(widget.set_video_size)
+    runner.session_changed.connect(window.on_video_session)
+    runner.stream_state.connect(window.show_overlay)
+    runner.stream_message.connect(window.statusBar().showMessage)
+    runner.clipboard_received.connect(window.set_clipboard_from_device)
 
     width, height = _DEFAULT_WINDOW
     window.resize(width, height)
@@ -135,42 +329,102 @@ def _run_gui(config: SessionConfig, session: ServerSession) -> int:
     # Release GL resources while the context is still alive: Qt does not do it
     # for us when a window closes.
     app.aboutToQuit.connect(widget.release_gpu_resources)
+    app.aboutToQuit.connect(runner.stop)
 
-    pipeline.start()
     _install_sigint_handler(app)
+    tracer = _install_tracer(config, app, runner, mailbox, widget)
 
     try:
         return app.exec()
     finally:
+        if tracer is not None:
+            tracer.stop()
+        runner.stop()
         widget.release_gpu_resources()  # no-op if aboutToQuit already ran
-        pipeline.stop()
-        if channel is not None:
-            channel.stop()
 
 
 def _status_text(
-    pipeline: VideoPipeline, mailbox: FrameMailbox, config: SessionConfig
+    runner: SessionRunner,
+    mailbox: FrameMailbox,
+    config: SessionConfig,
+    widget: VideoWidget | None = None,
 ) -> str:
-    stats = pipeline.stats
-    parts = [
-        f"{stats.width}x{stats.height}",
-        f"{stats.fps:.1f} fps",
-        f"decode {stats.average_decode_ms:.1f} ms",
+    """The line shown in the status bar, and logged when tracing."""
+    stats = runner.stats()
+    parts: list[str] = []
+
+    if stats is None or stats.width == 0:
+        parts.append("waiting for video")
+    else:
+        parts.append(f"{stats.width}x{stats.height}")
+        parts.append(f"{stats.fps:.1f} fps")
+        parts.append(f"decode {stats.average_decode_ms:.1f} ms")
         # Waiting vs working is measured entirely on our own clock, so unlike a
-        # host/device timestamp comparison it cannot drift: it tells you
-        # whether the software is keeping up with the device.
-        f"{stats.idle_fraction * 100:.0f}% idle",
-        config.video_codec,
-    ]
+        # host/device timestamp comparison it cannot drift: it tells you whether
+        # the software is keeping up with the device.
+        parts.append(f"{stats.idle_fraction * 100:.0f}% idle")
+        parts.append(config.video_codec)
+
+        quiet_for = runner.seconds_since_last_frame()
+        if quiet_for > 1.5:
+            # Frames only arrive when something changes on screen, so this is
+            # normal while nothing moves - and it is also what a stalled encoder
+            # looks like, which is exactly why it is worth showing.
+            parts.append(f"no frames for {quiet_for:.1f}s")
+        if stats.long_frame_gaps:
+            parts.append(f"gaps>250ms: {stats.long_frame_gaps}")
+
+    if widget is not None:
+        paints = widget.paint_stats()
+        if paints["paints"]:
+            # Paints per second versus frames per second is what shows whether
+            # the UI thread, rather than the device, is the limit; the request
+            # rate shows how many repaints the stream asked for.
+            parts.append(
+                f"ui {paints['paints_per_second']:.0f}/s "
+                f"(req {paints['requests_per_second']:.0f}/s)"
+            )
+            parts.append(f"paint {paints['average_paint_ms']:.1f} ms")
+
     if mailbox.overwritten:
         parts.append(f"dropped {mailbox.overwritten}")
-    if stats.frames:
-        parts.append(f"avg {stats.bytes_received / stats.frames / 1024:.0f} KiB/frame")
     return "  ·  ".join(parts)
 
 
-def _discard(_payload: bytes) -> None:
-    """Placeholder control sink when control is disabled."""
+def _install_tracer(
+    config: SessionConfig,
+    app: QApplication,
+    runner: SessionRunner,
+    mailbox: FrameMailbox,
+    widget: VideoWidget,
+) -> QTimer | None:
+    """Log the status line periodically so stutter can be diagnosed later."""
+    if not config.trace:
+        return None
+
+    ticks = {"count": 0}
+
+    def _log() -> None:
+        ticks["count"] += 1
+        if ticks["count"] % _TRACE_EVERY:
+            return
+        stats = runner.stats()
+        gaps = f"{stats.max_frame_gap_ms:.0f}ms" if stats is not None else "n/a"
+        paints = widget.paint_stats()
+        log.info(
+            "stats: %s | worst gap %s | worst paint %.0f ms",
+            _status_text(runner, mailbox, config, widget),
+            gaps,
+            paints["max_paint_ms"],
+        )
+
+    timer = QTimer(app)
+    timer.setInterval(_STATUS_INTERVAL_MS)
+    timer.timeout.connect(_log)
+    timer.start()
+    # Keep a reference alive on the application object.
+    app._mirror_screen_tracer = timer
+    return timer
 
 
 def _install_sigint_handler(app: QApplication) -> None:
@@ -189,8 +443,9 @@ def _install_sigint_handler(app: QApplication) -> None:
 
 
 __all__ = [
-    "UiBridge",
+    "SessionRunner",
     "configure_surface_format",
+    "reconnect_delays",
     "run",
     "start_device_session",
 ]

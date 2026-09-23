@@ -25,6 +25,10 @@ from .frame import VideoFrame
 
 log = logging.getLogger(__name__)
 
+#: A gap longer than this between frames counts as a stall, unless the screen was
+#: simply not changing.
+_LONG_FRAME_GAP_MS = 250.0
+
 
 class FrameMailbox:
     """A single-slot mailbox holding only the most recent frame."""
@@ -69,6 +73,14 @@ class PipelineStats:
     #: ``decode_seconds`` are the only latency figures that can be measured on
     #: one clock, which makes them the trustworthy ones.
     read_wait_seconds: float = 0.0
+    #: Host time of the most recent frame, for detecting a stalled stream.
+    last_frame_time: float = 0.0
+    #: Longest gap between two frames, and how many gaps exceeded 250 ms. A
+    #: static screen legitimately produces gaps (nothing changed, so the device
+    #: sends nothing), so treat this as "the device had nothing for us", which
+    #: during visible motion means a stall.
+    max_frame_gap_ms: float = 0.0
+    long_frame_gaps: int = 0
     #: Raw difference between host elapsed time and device timestamp progress.
     #: Useful only for spotting a runaway queue: it also grows linearly from
     #: device clock/quantisation drift, so it is not a latency measurement.
@@ -157,6 +169,12 @@ class VideoPipeline:
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def seconds_since_last_frame(self) -> float:
+        """Time since the last decoded frame; large on a static screen too."""
+        if not self.stats.last_frame_time:
+            return 0.0
+        return time.perf_counter() - self.stats.last_frame_time
 
     def _handle_end(self, reason: str) -> None:
         log.info("video pipeline ended: %s", reason)
@@ -252,6 +270,15 @@ class VideoPipeline:
 
     def _publish(self, frame: VideoFrame) -> None:
         now = time.perf_counter()
+
+        if self.stats.last_frame_time:
+            gap_ms = (now - self.stats.last_frame_time) * 1000.0
+            if gap_ms > self.stats.max_frame_gap_ms:
+                self.stats.max_frame_gap_ms = gap_ms
+            if gap_ms > _LONG_FRAME_GAP_MS:
+                self.stats.long_frame_gaps += 1
+        self.stats.last_frame_time = now
+
         self.stats.frames += 1
         self._frame_times.append(now)
 

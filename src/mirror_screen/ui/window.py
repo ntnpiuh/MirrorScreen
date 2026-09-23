@@ -6,15 +6,30 @@ import logging
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import QMainWindow, QMessageBox
+from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox
 
 from ..config import SessionConfig
-from ..control_channel import ControlChannel
 from .geometry import display_scale, fit_window_to_video
 from .widget import VideoWidget
+
+
+class DeviceCommands(Protocol):
+    """What the window needs in order to control the device.
+
+    Deliberately narrow: the owner of the session can swap the underlying
+    control socket (for example after reconnecting) without the window caring.
+    """
+
+    def rotate_device(self) -> None: ...
+
+    def set_display_power(self, on: bool) -> None: ...
+
+    def set_clipboard(self, text: str, *, paste: bool = False) -> None: ...
+
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +50,7 @@ class MirrorWindow(QMainWindow):
         config: SessionConfig,
         *,
         device_name: str,
-        channel: ControlChannel | None,
+        commands: DeviceCommands | None,
         stats_provider: Callable[[], str] | None = None,
         screenshot_dir: Path | None = None,
     ) -> None:
@@ -43,7 +58,7 @@ class MirrorWindow(QMainWindow):
         self._widget = widget
         self._config = config
         self._device_name = device_name
-        self._channel = channel
+        self._commands = commands
         self._stats_provider = stats_provider
         self._screenshot_dir = screenshot_dir or _default_screenshot_dir()
         self._display_on = True
@@ -56,7 +71,24 @@ class MirrorWindow(QMainWindow):
 
         self.setCentralWidget(widget)
         self.setWindowTitle(f"Mirror Screen - {device_name}")
-        self.statusBar().showMessage("connecting...")
+
+        # Live statistics get their own permanent widget. They used to be written
+        # with showMessage(), which silently overwrote every message about the
+        # stream itself - including "the device disconnected" - within half a
+        # second, leaving a frozen picture with no explanation on screen.
+        self._stats_label = QLabel("connecting...")
+        self.statusBar().addPermanentWidget(self._stats_label)
+
+        # Sits over the video and says what is going on when there is nothing to
+        # show: no device, stream stopped, reconnecting.
+        self._overlay = QLabel("", widget)
+        self._overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._overlay.setWordWrap(True)
+        self._overlay.setStyleSheet(
+            "QLabel { background-color: rgba(18, 18, 22, 225); color: #f2f2f2;"
+            " border-radius: 10px; padding: 14px 20px; font-size: 14px; }"
+        )
+        self._overlay.hide()
 
         self._build_actions()
 
@@ -127,21 +159,21 @@ class MirrorWindow(QMainWindow):
         self._update_escape_action()
 
     def rotate_device(self) -> None:
-        if self._channel is not None:
-            self._channel.rotate_device()
+        if self._commands is not None:
+            self._commands.rotate_device()
 
     def toggle_display_power(self) -> None:
-        if self._channel is None:
+        if self._commands is None:
             return
         self._display_on = not self._display_on
-        self._channel.set_display_power(self._display_on)
+        self._commands.set_display_power(self._display_on)
 
     def push_clipboard(self) -> None:
-        if self._channel is None:
+        if self._commands is None:
             return
         text = QGuiApplication.clipboard().text()
         if text:
-            self._channel.set_clipboard(text, paste=True)
+            self._commands.set_clipboard(text, paste=True)
 
     def save_screenshot(self) -> None:
         image = self._widget.screenshot()
@@ -268,16 +300,43 @@ class MirrorWindow(QMainWindow):
 
     def show_pipeline_error(self, message: str) -> None:
         self.statusBar().showMessage(f"stream stopped: {message}")
+        self.show_overlay(message)
 
     def show_pipeline_end(self, reason: str) -> None:
         self.statusBar().showMessage(reason)
+        self.show_overlay(reason)
 
     def show_fatal_error(self, message: str) -> None:
         QMessageBox.critical(self, "Mirror Screen", message)
 
     def _update_status(self) -> None:
         if self._stats_provider is not None:
-            self.statusBar().showMessage(self._stats_provider())
+            self._stats_label.setText(self._stats_provider())
+
+    # -- stream state -------------------------------------------------------
+    def show_overlay(self, text: str) -> None:
+        """Show a message over the video, or hide it when text is empty."""
+        if not text:
+            self._overlay.hide()
+            return
+        self._overlay.setText(text)
+        self._overlay.adjustSize()
+        self._position_overlay()
+        self._overlay.show()
+        self._overlay.raise_()
+
+    def _position_overlay(self) -> None:
+        if not self._overlay.isVisible():
+            return
+        widget = self._widget
+        self._overlay.move(
+            max((widget.width() - self._overlay.width()) // 2, 0),
+            max((widget.height() - self._overlay.height()) // 2, 0),
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_overlay()
 
 
 def _default_screenshot_dir() -> Path:

@@ -67,6 +67,11 @@ class SessionConfig:
     """Multiplier applied to scroll wheel / trackpad deltas. Negating it
     reverses the scroll direction."""
     show_stats: bool = True
+    auto_reconnect: bool = True
+    """Rebuild the session when the stream dies (the phone slept, the cable
+    moved, the server exited) instead of freezing on the last frame."""
+    trace: bool = False
+    """Log the live statistics every couple of seconds, for diagnosing stutter."""
     auto_resize_window: bool = True
     """Reshape the window to the video when the device rotates. Turned off
     automatically once the window is resized by hand."""

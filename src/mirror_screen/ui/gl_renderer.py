@@ -214,10 +214,14 @@ class YuvQuadRenderer:
         for index, (texture, plane) in enumerate(zip(self._textures, planes, strict=True)):
             self.gl.glActiveTexture(_GL_TEXTURE0 + index)
             texture.bind(index)
+            # Hand Qt a view of the plane instead of a copy: tobytes() memcpy'd
+            # ~3.8 MB per frame on the UI thread, and this is on the critical
+            # path between the device sending a frame and it being on screen.
+            payload = plane if plane.flags["C_CONTIGUOUS"] else plane.copy()
             texture.setData(
                 QOpenGLTexture.PixelFormat.Red,
                 QOpenGLTexture.PixelType.UInt8,
-                plane.tobytes(),
+                memoryview(payload),
                 self._transfer_options,
             )
 

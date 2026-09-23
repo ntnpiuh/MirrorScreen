@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt
@@ -42,6 +44,16 @@ _ANGLE_PER_NOTCH = 120.0
 _PIXELS_PER_NOTCH = 40.0
 
 
+def _rolling_rate(times: deque[float]) -> float:
+    """Events per second over the sampled window, or 0 with too few samples."""
+    if len(times) < 2:
+        return 0.0
+    span = times[-1] - times[0]
+    if span <= 0:
+        return 0.0
+    return (len(times) - 1) / span
+
+
 class VideoWidget(QOpenGLWidget):
     """Displays decoded frames and forwards input to the device."""
 
@@ -67,6 +79,20 @@ class VideoWidget(QOpenGLWidget):
         self._key_repeats: dict[int, int] = {}
         self._display_on = True
 
+        # Paint timing: the UI thread uploads the planes and draws, so whether
+        # it keeps up with the device is the difference between smooth video and
+        # visible stutter. Measured here rather than guessed at.
+        #
+        # The rates are rolling windows, deliberately not "since startup": an
+        # average taken from the first paint silently folds in every second the
+        # stream was down (during a reconnect, say) and makes a healthy UI look
+        # like it cannot keep up.
+        self._paint_count = 0
+        self._paint_seconds = 0.0
+        self._max_paint_ms = 0.0
+        self._paint_times: deque[float] = deque(maxlen=60)
+        self._update_times: deque[float] = deque(maxlen=60)
+
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
@@ -79,6 +105,7 @@ class VideoWidget(QOpenGLWidget):
 
     def refresh(self) -> None:
         """Called when new frames are available."""
+        self._update_times.append(time.perf_counter())
         self.update()
 
     @property
@@ -153,7 +180,33 @@ class VideoWidget(QOpenGLWidget):
     def resizeGL(self, width: int, height: int) -> None:
         self._renderer.set_viewport(width, height)
 
+    def paint_stats(self) -> dict[str, float]:
+        """How the UI thread is coping, over a rolling window of recent frames."""
+        return {
+            "paints": float(self._paint_count),
+            "paints_per_second": _rolling_rate(self._paint_times),
+            "requests_per_second": _rolling_rate(self._update_times),
+            "average_paint_ms": (
+                self._paint_seconds / self._paint_count * 1000.0
+                if self._paint_count
+                else 0.0
+            ),
+            "max_paint_ms": self._max_paint_ms,
+        }
+
     def paintGL(self) -> None:
+        started = time.perf_counter()
+        self._paint_times.append(started)
+        try:
+            self._paint_frame()
+        finally:
+            took_ms = (time.perf_counter() - started) * 1000.0
+            self._paint_count += 1
+            self._paint_seconds += took_ms / 1000.0
+            if took_ms > self._max_paint_ms:
+                self._max_paint_ms = took_ms
+
+    def _paint_frame(self) -> None:
         self._renderer.clear()
 
         frame = self._mailbox.take()

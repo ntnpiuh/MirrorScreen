@@ -153,6 +153,35 @@ is why they can be trusted:
   consume them, so the software adds no backlog; if it drops, decoding has
   become the bottleneck and delay will start to accumulate.
 
+### Diagnosing stutter
+
+Run with `--trace` to log the status line every 2 s. The numbers are chosen so
+they say *where* a problem is, rather than leaving you to guess:
+
+```
+1080x2340 · 57.4 fps · decode 7.0 ms · 71% idle · h264 · ui 57/s (req 57/s) · paint 2.3 ms
+| worst gap 2799ms | worst paint 49 ms
+```
+
+- **`fps` vs `ui …/s (req …/s)`** — frames decoded per second, versus paints per
+  second and how many repaints the stream asked for. If `req` matches `fps` but
+  `ui` is lower, the UI thread is the limit; if they all match, the client is
+  keeping up and any stutter is happening on the phone.
+- **`paint`** — how long the UI thread spends uploading planes and drawing. A few
+  milliseconds is normal; a large `worst paint` points at a one-off stall
+  (usually texture allocation at startup).
+- **`gaps>250ms` / `worst gap`** — periods where the device sent nothing. Normal
+  on a static screen (nothing changed, so nothing is encoded), a stall if the
+  screen was visibly moving.
+- **`no frames for Ns`** — the same thing live, in the status bar.
+- **`dropped`** — frames replaced in the mailbox before the UI picked them up.
+  Dropping is the designed behaviour (it keeps lag from building up), but a
+  steadily climbing count means something is slower than the stream.
+
+The rates are rolling windows, not averages since startup: a cumulative average
+silently includes every second the stream was down and can make a healthy client
+look like it is falling behind.
+
 End-to-end latency (device encode + USB + decode + present) cannot be measured
 from this side without synchronising two unrelated clocks. scrcpy estimates it by
 comparing the host clock against device timestamps, but that figure also grows
@@ -309,6 +338,7 @@ the phone's screen exactly, including after a rotation.
 | `no Android device found` | Unlock the phone, re-accept the USB debugging prompt, check `mirror-screen devices` |
 | `device is unauthorized` | Accept the prompt on the phone; if it never appears, revoke USB debugging authorizations and replug |
 | Version mismatch error | Delete the cache (`~/Library/Caches/mirror-screen`) and re-run `mirror-screen setup` |
+| Window stops updating / frozen picture | The session dropped (phone slept, cable moved). The app rebuilds it and shows a message over the video; check the phone is still plugged in with USB debugging on |
 | Black window | The device screen may be off — press `Cmd/Ctrl+P` or power the phone on |
 | Washed-out or tinted colours | Try `--color-matrix bt601` or `--color-range full` |
 | Feels laggy | Add `--no-vsync`, reduce `--max-size`, raise `--bit-rate`, or prefer H.264 |

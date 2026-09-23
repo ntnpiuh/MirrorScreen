@@ -219,6 +219,16 @@ def _add_window_options(parser: argparse.ArgumentParser) -> None:
         help="do not reshape the window when the device rotates",
     )
     window.add_argument(
+        "--no-reconnect",
+        action="store_true",
+        help="stop instead of rebuilding the session when the stream drops",
+    )
+    window.add_argument(
+        "--trace",
+        action="store_true",
+        help="log live statistics every 2s (useful when diagnosing stutter)",
+    )
+    window.add_argument(
         "--color-matrix",
         choices=["auto", "bt601", "bt709"],
         default="auto",
@@ -273,6 +283,8 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         vsync=not getattr(args, "no_vsync", False),
         show_stats=not getattr(args, "no_stats", False),
         auto_resize_window=not getattr(args, "no_auto_resize", False),
+        auto_reconnect=not getattr(args, "no_reconnect", False),
+        trace=getattr(args, "trace", False),
         color_matrix=getattr(args, "color_matrix", "auto"),
         color_range=getattr(args, "color_range", "auto"),
         scroll_scale=getattr(args, "scroll_scale", 1.0),
