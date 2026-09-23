@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mirror-screen"
+version = "0.1.0"
+description = "High-resolution, low-latency Android screen mirroring to macOS (and Linux/Windows)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "av>=14.0",
+    "numpy>=1.26",
+    "PySide6-Essentials>=6.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mirror-screen = "mirror_screen.cli:main"
+
+[project.gui-scripts]
+mirror-screen-gui = "mirror_screen.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mirror_screen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
