@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from typing import Literal, cast
 
 from mirror_screen.cli import _config_from_args, build_parser, main
 from mirror_screen.config import SessionConfig
@@ -11,6 +12,27 @@ from mirror_screen.config import SessionConfig
 def test_defaults_are_valid():
     config = SessionConfig()
     config.validate()
+    assert config.phone_playback == "keep"
+    assert config.audio_output is None
+
+
+@pytest.mark.parametrize("policy", ["keep", "mute"])
+def test_phone_playback_policy_is_valid(policy):
+    config = SessionConfig(audio=True, phone_playback=policy)
+    config.validate()
+
+
+def test_invalid_phone_playback_policy_is_rejected():
+    invalid_policy = cast(Literal["keep", "mute"], "pause")
+    config = SessionConfig(phone_playback=invalid_policy)
+    with pytest.raises(ValueError, match="phone playback policy"):
+        config.validate()
+
+
+def test_blank_audio_output_is_rejected():
+    config = SessionConfig(audio_output="  ")
+    with pytest.raises(ValueError, match="audio_output"):
+        config.validate()
 
 
 def test_invalid_codec_is_rejected():
@@ -110,6 +132,18 @@ def test_cli_translates_flags_into_configuration():
     assert config.scale == 2.0
     assert config.video_codec_options == [("profile", "1")]
     assert config.serial == "ABC123"
+
+
+def test_cli_translates_audio_policy_and_output():
+    parser = build_parser()
+    args = parser.parse_args(
+        ["run", "--audio", "--mute-phone-audio", "--audio-output", "headphones"]
+    )
+    config = _config_from_args(args)
+    config.validate()
+    assert config.audio is True
+    assert config.phone_playback == "mute"
+    assert config.audio_output == "headphones"
 
 
 def test_link_quality_maps_to_bandwidth_and_resolution():

@@ -11,6 +11,7 @@ dist/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+plan.md
 
 # Local artifacts
 .cache/

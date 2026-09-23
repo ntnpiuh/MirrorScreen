@@ -1,0 +1,89 @@
+name: Build and release desktop apps
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            runner: macos-15
+            platform: macos-arm64
+          - label: macOS Intel
+            runner: macos-15-intel
+            platform: macos-x86_64
+          - label: Windows x64
+            runner: windows-2025
+            platform: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies and build macOS app
+        if: startsWith(matrix.platform, 'macos-')
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install '.[dev]' pyinstaller
+          ./packaging/build_macos_app.sh
+          test -f "dist/Mirror-Screen-${{ matrix.platform }}.zip"
+
+      - name: Install dependencies and build Windows app
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --upgrade pip
+          .venv\Scripts\python -m pip install '.[dev]' pyinstaller
+          .venv\Scripts\python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --name 'Mirror Screen' `
+            --paths src `
+            --distpath dist `
+            --workpath build `
+            --specpath build `
+            packaging/windows_entry.py
+          Compress-Archive -Path 'dist/Mirror Screen' `
+            -DestinationPath 'dist/Mirror-Screen-windows-x64.zip' -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/Mirror-Screen-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release assets
+        run: |
+          test "$(find release-assets -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 3
+          ls -lh release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Mirror Screen ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*.zip

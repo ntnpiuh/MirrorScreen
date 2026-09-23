@@ -43,6 +43,8 @@ AUDIO_CODECS: dict[str, int] = {
     "raw": CODEC_RAW,
 }
 
+AUDIO_CODEC_NAMES: dict[int, str] = {value: name for name, value in AUDIO_CODECS.items()}
+
 #: PyAV/FFmpeg decoder name for each protocol codec name.
 FFMPEG_DECODERS: dict[str, str] = {
     "h264": "h264",
@@ -51,6 +53,8 @@ FFMPEG_DECODERS: dict[str, str] = {
     "vp8": "vp8",
     "vp9": "vp9",
     "opus": "opus",
+    "aac": "aac",
+    "flac": "flac",
 }
 
 #: Codecs where a MediaCodec config packet (SPS/PPS, VPS) must be prepended to

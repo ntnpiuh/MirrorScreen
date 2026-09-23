@@ -349,6 +349,7 @@ class ScrcpyServer:
             ("log_level", config.log_level),
             ("video", "true"),
             ("audio", _bool(config.audio)),
+            ("audio_dup", _bool(config.phone_playback == "keep")),
             ("control", _bool(config.control)),
             ("video_codec", config.video_codec),
             ("video_bit_rate", str(config.video_bit_rate)),

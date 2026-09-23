@@ -159,10 +159,26 @@ def _add_video_options(parser: argparse.ArgumentParser) -> None:
         help="extra MediaCodec option, repeatable (for example "
         "profile:1,i-frame-interval:10)",
     )
+    video.add_argument("--audio", action="store_true", help="play phone audio locally")
+    playback = video.add_mutually_exclusive_group()
+    playback.add_argument(
+        "--keep-phone-audio",
+        dest="phone_playback",
+        action="store_const",
+        const="keep",
+        help="keep playing audio on the phone while forwarding it (default)",
+    )
+    playback.add_argument(
+        "--mute-phone-audio",
+        dest="phone_playback",
+        action="store_const",
+        const="mute",
+        help="mute phone playback while forwarding audio",
+    )
     video.add_argument(
-        "--audio",
-        action="store_true",
-        help="reserve the audio socket (audio playback is not implemented yet)",
+        "--audio-output",
+        metavar="ID",
+        help="local audio output device id; default uses the system output",
     )
 
     device = parser.add_argument_group("device behaviour")
@@ -291,6 +307,8 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         video_codec=getattr(args, "codec", "h264"),
         video_codec_options=codec_options,
         audio=getattr(args, "audio", False),
+        phone_playback=getattr(args, "phone_playback", None) or "keep",
+        audio_output=getattr(args, "audio_output", None),
         control=not getattr(args, "no_control", False),
         show_touches=getattr(args, "show_touches", False),
         stay_awake=not getattr(args, "no_stay_awake", False),

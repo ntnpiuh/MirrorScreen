@@ -39,6 +39,7 @@ from .const import (
     PACKET_FLAG_KEY_FRAME,
     PACKET_HEADER_SIZE,
     PACKET_PTS_MASK,
+    AUDIO_CODEC_NAMES,
     VIDEO_CODEC_NAMES,
 )
 from .io import ByteSource, read_u32, read_u64
@@ -220,4 +221,33 @@ class VideoDemuxer:
 
 def read_audio_codec_id(source: ByteSource) -> int:
     """Read the audio stream codec id (the audio socket has no session packet)."""
-    return read_u32(source.read_exact(4))
+    codec_id = read_u32(source.read_exact(4))
+    if codec_id not in AUDIO_CODEC_NAMES:
+        raise ProtocolError(f"unsupported audio codec id: 0x{codec_id:08x}")
+    return codec_id
+
+
+class AudioDemuxer:
+    """Turn the audio socket into bounded encoded media packets."""
+
+    def __init__(self, source: ByteSource) -> None:
+        self._source = source
+        self.codec_id = read_audio_codec_id(source)
+
+    def read_packet(self) -> MediaPacket:
+        """Read one encoded audio access unit with strict bounds checks."""
+        header = self._source.read_exact(PACKET_HEADER_SIZE)
+        pts_us, payload_size, is_config, is_key_frame = parse_media_header(header)
+        return MediaPacket(
+            payload=self._source.read_exact(payload_size),
+            pts_us=pts_us,
+            config=is_config,
+            key_frame=is_key_frame,
+        )
+
+    def __iter__(self) -> Iterator[MediaPacket]:
+        while True:
+            try:
+                yield self.read_packet()
+            except ConnectionClosed:
+                return

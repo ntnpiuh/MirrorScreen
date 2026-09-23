@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from .protocol.const import VIDEO_CODECS
 
@@ -44,6 +45,10 @@ class SessionConfig:
     """Frame rate cap. 0 lets the device encode as fast as it can."""
     video_bit_rate: int = DEFAULT_VIDEO_BIT_RATE
     audio: bool = False
+    phone_playback: Literal["keep", "mute"] = "keep"
+    """Whether forwarded audio is also kept playing on the Android device."""
+    audio_output: str | None = None
+    """Optional local output device id; ``None`` means the system default."""
     control: bool = True
     force_adb_forward: bool = False
     """Use an adb *forward* tunnel (client connects) instead of the default
@@ -119,6 +124,13 @@ class SessionConfig:
 
         if self.video_bit_rate <= 0:
             raise ValueError("video_bit_rate must be > 0")
+
+        if self.phone_playback not in {"keep", "mute"}:
+            raise ValueError(
+                f"unsupported phone playback policy: {self.phone_playback!r}"
+            )
+        if self.audio_output is not None and not self.audio_output.strip():
+            raise ValueError("audio_output must be non-empty when provided")
 
         if self.log_level not in {"verbose", "debug", "info", "warn", "error"}:
             raise ValueError(f"unsupported log level: {self.log_level!r}")

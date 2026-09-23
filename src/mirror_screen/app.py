@@ -10,17 +10,20 @@ from collections.abc import Iterator
 from itertools import chain, repeat
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 
 from .adb import Adb, cache_root, ensure_adb
+from .audio import AudioStats, AudioWorker
+from .audio_sink import QtAudioSink
 from .config import SessionConfig
 from .control_channel import ControlChannel
 from .errors import MirrorScreenError
 from .scrcpy import ScrcpyServer, ServerSession, ensure_server_jar
 from .ui.widget import VideoWidget
 from .ui.window import MirrorWindow
+from .ui.settings import PreMirrorSettingsDialog
 from .video.pipeline import FrameMailbox, PipelineCallbacks, PipelineStats, VideoPipeline
 
 log = logging.getLogger(__name__)
@@ -74,6 +77,9 @@ class SessionRunner(QObject):
     stream_message = Signal(str)
     """One-off message for the status bar."""
 
+    startup_failed = Signal(str)
+    """Emitted when the first session cannot be started."""
+
     device_ready = Signal(str)
     """Emitted with the device name once a session is up."""
 
@@ -101,6 +107,7 @@ class SessionRunner(QObject):
         self._thread: threading.Thread | None = None
         self._server: ScrcpyServer | None = None
         self._pipeline: VideoPipeline | None = None
+        self._audio: AudioWorker | None = None
         self._channel: ControlChannel | None = None
         self._device_name = ""
 
@@ -112,6 +119,28 @@ class SessionRunner(QObject):
             target=self._supervise, name="session-supervisor", daemon=True
         )
         self._thread.start()
+
+    def start_async(self) -> None:
+        """Start without blocking the Qt GUI while adb performs handshakes."""
+        if self._thread is not None:
+            raise RuntimeError("session already started")
+        self._thread = threading.Thread(
+            target=self._start_and_supervise, name="session-supervisor", daemon=True
+        )
+        self._thread.start()
+
+    def _start_and_supervise(self) -> None:
+        self.stream_state.emit("connecting")
+        try:
+            self._open_session()
+        except Exception as exc:
+            log.error("session startup failed: %s", exc)
+            self.stream_state.emit("startup failed")
+            self.stream_message.emit(str(exc))
+            self._teardown()
+            self.startup_failed.emit(str(exc))
+            return
+        self._supervise()
 
     def stop(self) -> None:
         """Shut the session down and stop supervising."""
@@ -130,6 +159,12 @@ class SessionRunner(QObject):
         with self._lock:
             pipeline = self._pipeline
         return pipeline.stats if pipeline is not None else None
+
+    def audio_stats(self) -> AudioStats | None:
+        """Return audio counters for the active session, if audio is running."""
+        with self._lock:
+            audio = self._audio
+        return audio.stats() if audio is not None else None
 
     def seconds_since_last_frame(self) -> float:
         with self._lock:
@@ -161,38 +196,72 @@ class SessionRunner(QObject):
         config = self._config
         adb = Adb(self._adb_path, config.serial)
         server = ScrcpyServer(adb, self._jar, config)
-        session = server.start()
-        self._server = server
-        self._device_name = session.device_name
-
         channel: ControlChannel | None = None
-        if session.control is not None:
-            channel = ControlChannel(
-                session.control,
-                on_clipboard=self.clipboard_received.emit,
-            )
-            channel.start()
+        pipeline: VideoPipeline | None = None
+        audio: AudioWorker | None = None
+        try:
+            session = server.start()
+            self._server = server
+            self._device_name = session.device_name
 
-        pipeline = VideoPipeline(
-            session.video,
-            config,
-            self._mailbox,
-            PipelineCallbacks(
-                on_frame=lambda _frame: self.frame_ready.emit(),
-                on_session=lambda packet: self.session_changed.emit(
-                    packet.width, packet.height
+            if session.control is not None:
+                channel = ControlChannel(
+                    session.control,
+                    on_clipboard=self.clipboard_received.emit,
+                )
+                channel.start()
+
+            pipeline = VideoPipeline(
+                session.video,
+                config,
+                self._mailbox,
+                PipelineCallbacks(
+                    on_frame=lambda _frame: self.frame_ready.emit(),
+                    on_session=lambda packet: self.session_changed.emit(
+                        packet.width, packet.height
+                    ),
+                    on_end=lambda reason: self.stream_message.emit(reason),
+                    on_error=lambda exc: self.stream_message.emit(str(exc)),
                 ),
-                # The supervisor thread reports the end; the pipeline callbacks
-                # only need to surface the wording.
-                on_end=lambda reason: self.stream_message.emit(reason),
-                on_error=lambda exc: self.stream_message.emit(str(exc)),
-            ),
-        )
+            )
 
-        with self._lock:
-            self._channel = channel
-            self._pipeline = pipeline
-        pipeline.start()
+            if config.audio and session.audio is not None:
+                try:
+                    sink = QtAudioSink(config.audio_output)
+                    audio = AudioWorker(
+                        session.audio,
+                        sink,
+                        on_error=lambda exc: self.stream_message.emit(
+                            f"audio stopped: {exc}"
+                        ),
+                    )
+                    audio.start()
+                except Exception as exc:
+                    # Audio is an optional stream; keep video usable when the
+                    # platform backend is unavailable or cannot start.
+                    log.warning("audio unavailable: %s", exc)
+                    self.stream_message.emit(f"audio unavailable: {exc}")
+
+            with self._lock:
+                self._channel = channel
+                self._pipeline = pipeline
+                self._audio = audio
+            pipeline.start()
+        except Exception:
+            if audio is not None:
+                audio.stop()
+            if pipeline is not None:
+                pipeline.stop()
+            if channel is not None:
+                channel.stop()
+            server.stop()
+            with self._lock:
+                self._server = None
+                self._channel = None
+                self._pipeline = None
+                self._audio = None
+            self._device_name = ""
+            raise
 
         log.info("session up: %s", session.device_name)
         self.device_ready.emit(session.device_name)
@@ -200,13 +269,21 @@ class SessionRunner(QObject):
 
     def _teardown(self) -> None:
         with self._lock:
-            pipeline, channel, server = self._pipeline, self._channel, self._server
+            pipeline, audio, channel, server = (
+                self._pipeline,
+                self._audio,
+                self._channel,
+                self._server,
+            )
             self._pipeline = None
+            self._audio = None
             self._channel = None
             self._server = None
 
         if pipeline is not None:
             pipeline.stop()  # also unblocks the supervisor's join()
+        if audio is not None:
+            audio.stop()
         if channel is not None:
             channel.stop()
         if server is not None:
@@ -256,18 +333,72 @@ class SessionRunner(QObject):
         return False  # pragma: no cover - reconnect_delays() never ends
 
 
+class _ResourceResolver(QObject):
+    """Resolve bundled resources away from the Qt GUI thread."""
+
+    ready = Signal(object, object)
+    failed = Signal(str)
+    resolved = Signal(object, object)
+    failed_on_gui = Signal(str)
+
+    def __init__(self, config: SessionConfig, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._stop = threading.Event()
+        self.ready.connect(self._forward_ready)
+        self.failed.connect(self._forward_failure)
+
+    @Slot(object, object)
+    def _forward_ready(self, adb_path: Path, jar: Path) -> None:
+        self.resolved.emit(adb_path, jar)
+
+    @Slot(str)
+    def _forward_failure(self, message: str) -> None:
+        self.failed_on_gui.emit(message)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def resolve(self) -> None:
+        if self._stop.is_set():
+            return
+        try:
+            progress = lambda message: log.info("startup: %s", message)
+            adb_path = ensure_adb(self._config.adb_path, progress=progress)
+            cache = (
+                Path(self._config.cache_dir)
+                if self._config.cache_dir
+                else cache_root()
+            )
+            jar = ensure_server_jar(cache, progress=progress)
+        except Exception as exc:
+            if self._stop.is_set():
+                return
+            self.failed.emit(str(exc))
+            return
+        if self._stop.is_set():
+            return
+        self.ready.emit(adb_path, jar)
+
+
+class _GuiCallback(QObject):
+    """Marshal a callback emitted by a worker onto the Qt GUI thread."""
+
+    def __init__(self, callback, parent: QObject) -> None:
+        super().__init__(parent)
+        self._callback = callback
+
+    @Slot(str)
+    def call(self, message: str) -> None:
+        self._callback(message)
+
+
 def run(config: SessionConfig, *, progress=None) -> int:
     """Run a full mirroring session; returns a process exit code."""
     config.validate()
     progress = progress or (lambda message: print(message, file=sys.stderr))
 
-    adb_path = ensure_adb(config.adb_path, progress=progress)
-    log.info("using adb at %s", adb_path)
-
-    cache = Path(config.cache_dir) if config.cache_dir else cache_root()
-    jar = ensure_server_jar(cache, progress=progress)
-
-    return _run_gui(config, adb_path, jar)
+    return _run_gui(config, progress=progress)
 
 
 def start_device_session(
@@ -291,56 +422,143 @@ def start_device_session(
     return server, server.start()
 
 
-def _run_gui(config: SessionConfig, adb_path: Path, jar: Path) -> int:
+def _run_gui(config: SessionConfig, *, progress=None) -> int:
     configure_surface_format(vsync=config.vsync)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("Mirror Screen")
     app.setApplicationDisplayName("Mirror Screen")
+    # The settings dialog is accepted (and hidden) before adb/server resource
+    # resolution finishes and the stream window is shown. Do not let Qt quit
+    # the event loop during that gap; Cancel and the explicit shutdown path
+    # below own application exit.
+    app.setQuitOnLastWindowClosed(False)
 
-    mailbox = FrameMailbox()
-    runner = SessionRunner(config, mailbox, adb_path=adb_path, jar=jar)
+    control = PreMirrorSettingsDialog(config)
+    mailbox: FrameMailbox | None = None
+    runner: SessionRunner | None = None
+    window: MirrorWindow | None = None
+    resolver: _ResourceResolver | None = None
+    resolver_thread: threading.Thread | None = None
+    widget: VideoWidget | None = None
+    failure_bridge: _GuiCallback | None = None
+    tracer: QTimer | None = None
 
-    try:
-        runner.start()
-    except MirrorScreenError as exc:
-        # Nothing to show yet, so report it the way a command line tool should.
-        raise MirrorScreenError(str(exc)) from exc
+    def start_stream() -> None:
+        nonlocal mailbox, runner, window, resolver, resolver_thread
+        selected = control.build_config()
+        control.setEnabled(False)
+        control.setWindowTitle("Mirror Screen - connecting")
+        resolver = _ResourceResolver(selected)
 
-    widget = VideoWidget(config, mailbox, runner.send_control)
-    window = MirrorWindow(
-        widget,
-        config,
-        device_name=runner.device_name,
-        commands=runner,
-        stats_provider=lambda: _status_text(runner, mailbox, config, widget),
-    )
+        def resolve() -> None:
+            assert resolver is not None
+            resolver.resolve()
 
-    runner.frame_ready.connect(widget.refresh)
-    runner.session_changed.connect(widget.set_video_size)
-    runner.session_changed.connect(window.on_video_session)
-    runner.stream_state.connect(window.show_overlay)
-    runner.stream_message.connect(window.statusBar().showMessage)
-    runner.clipboard_received.connect(window.set_clipboard_from_device)
+        resolver_thread = threading.Thread(target=resolve, name="resource-resolver", daemon=True)
+        resolver.resolved.connect(open_stream)
+        resolver.failed_on_gui.connect(resource_failed)
+        resolver_thread.start()
 
-    width, height = _DEFAULT_WINDOW
-    window.resize(width, height)
-    window.show()
+    def resource_failed(message: str) -> None:
+        control.setEnabled(True)
+        control.setWindowTitle(f"Mirror Screen - startup failed: {message}")
+        control.show()
+        log.error("startup failed: %s", message)
+
+    def open_stream(adb_path: Path, jar: Path) -> None:
+        nonlocal mailbox, runner, window, widget, failure_bridge, tracer
+        selected = control.build_config()
+        mailbox = FrameMailbox()
+        runner = SessionRunner(selected, mailbox, adb_path=adb_path, jar=jar)
+        widget = VideoWidget(selected, mailbox, runner.send_control)
+        window = MirrorWindow(
+            widget,
+            selected,
+            device_name="connecting",
+            commands=runner,
+            stats_provider=lambda: _status_text(runner, mailbox, selected, widget),
+            on_close=stream_closed,
+        )
+        runner.frame_ready.connect(widget.refresh)
+        runner.device_ready.connect(lambda name: window.setWindowTitle(f"Mirror Screen - {name}"))
+        runner.session_changed.connect(widget.set_video_size)
+        runner.session_changed.connect(window.on_video_session)
+        runner.stream_state.connect(window.show_overlay)
+        runner.stream_message.connect(window.statusBar().showMessage)
+        runner.clipboard_received.connect(window.set_clipboard_from_device)
+        if failure_bridge is None:
+            failure_bridge = _GuiCallback(startup_failed, app)
+        runner.startup_failed.connect(failure_bridge.call)
+        window.resize(*_DEFAULT_WINDOW)
+        control.hide()
+        window.show()
+        runner.start_async()
+        if tracer is not None:
+            tracer.stop()
+        tracer = _install_tracer(selected, app, runner, mailbox, widget)
+
+    def _stop_tracer() -> None:
+        nonlocal tracer
+        if tracer is not None:
+            tracer.stop()
+            tracer = None
+
+    def startup_failed(message: str) -> None:
+        """Return to the control panel when async session startup fails."""
+        nonlocal window, runner
+        _stop_tracer()
+        if runner is not None:
+            runner.stop()
+        if window is not None:
+            window.deleteLater()
+            window = None
+        runner = None
+        control.setEnabled(True)
+        control.setWindowTitle(f"Mirror Screen - startup failed: {message}")
+        control.show()
+
+    def stream_closed() -> None:
+        nonlocal window, runner
+        _stop_tracer()
+        if runner is not None:
+            runner.stop()
+        if window is not None:
+            window.deleteLater()
+            window = None
+        runner = None
+        control.setEnabled(True)
+        control.show()
+
+    control.accepted.connect(start_stream)
+    control.rejected.connect(app.quit)
+    control.show()
 
     # Release GL resources while the context is still alive: Qt does not do it
     # for us when a window closes.
-    app.aboutToQuit.connect(widget.release_gpu_resources)
-    app.aboutToQuit.connect(runner.stop)
+    def shutdown() -> None:
+        _stop_tracer()
+        if resolver is not None:
+            resolver.stop()
+        if resolver_thread is not None and resolver_thread.is_alive():
+            resolver_thread.join(timeout=5)
+        if window is not None:
+            window._widget.release_gpu_resources()
+        if runner is not None:
+            runner.stop()
+
+    app.aboutToQuit.connect(shutdown)
 
     _install_sigint_handler(app)
-    tracer = _install_tracer(config, app, runner, mailbox, widget)
 
     try:
         return app.exec()
     finally:
         if tracer is not None:
             tracer.stop()
-        runner.stop()
-        widget.release_gpu_resources()  # no-op if aboutToQuit already ran
+        if runner is not None:
+            runner.stop()
+        if widget is not None:
+            widget.release_gpu_resources()  # no-op if aboutToQuit already ran
 
 
 def _status_text(
@@ -351,6 +569,7 @@ def _status_text(
 ) -> str:
     """The line shown in the status bar, and logged when tracing."""
     stats = runner.stats()
+    audio_stats = runner.audio_stats()
     parts: list[str] = []
 
     if stats is None or stats.width == 0:
@@ -385,6 +604,13 @@ def _status_text(
                 f"(req {paints['requests_per_second']:.0f}/s)"
             )
             parts.append(f"paint {paints['average_paint_ms']:.1f} ms")
+
+    if audio_stats is not None:
+        parts.append(f"audio start {audio_stats.startup_ms:.0f} ms")
+        if audio_stats.dropped:
+            parts.append(f"audio dropped {audio_stats.dropped}")
+        if audio_stats.underruns:
+            parts.append(f"audio underruns {audio_stats.underruns}")
 
     if mailbox.overwritten:
         parts.append(f"dropped {mailbox.overwritten}")

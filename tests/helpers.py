@@ -32,3 +32,10 @@ def media_header(
     if key_frame and not config:
         flags |= PACKET_FLAG_KEY_FRAME
     return struct.pack(">QI", flags, size)
+
+
+def audio_codec_header(name: str = "opus") -> bytes:
+    """The codec id that prefixes a scrcpy audio stream."""
+    from mirror_screen.protocol.const import AUDIO_CODECS
+
+    return AUDIO_CODECS[name].to_bytes(4, "big")

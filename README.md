@@ -87,6 +87,12 @@ bundle to show the latency settings UI before connecting to the phone. The
 first run may still download `adb` and the pinned scrcpy server into the user's
 cache.
 
+Prebuilt release downloads are published for macOS Apple Silicon, macOS Intel,
+and Windows x64 on the GitHub Releases page. The macOS builds are not signed or
+notarized; macOS may require users to approve the app in Privacy & Security
+before its first launch. The Windows ZIP contains a portable app folder and
+does not require a Python installation.
+
 From a terminal, the equivalent is:
 
 ```bash
@@ -119,6 +125,19 @@ prompt when you plug it in.
 | `Cmd/Ctrl+Q` | quit |
 
 ## Tuning
+
+### Audio
+
+Audio is disabled unless `--audio` is selected. When enabled, Mirror Screen
+plays phone audio through the system default output. Use `--audio-output ID` to
+select a QtMultimedia output device when the platform backend is available.
+Phone playback is kept by default; use `--mute-phone-audio` to forward audio
+only to the Mac, or `--keep-phone-audio` to make the default explicit. If the
+audio backend cannot start, video continues and the status message reports the
+audio error.
+
+The macOS output-device list requires `PySide6-Addons`. The system default
+remains the fallback when no output device can be enumerated.
 
 ```bash
 # Everything at native resolution, high bit rate, uncapped frame rate

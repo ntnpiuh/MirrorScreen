@@ -53,6 +53,7 @@ class MirrorWindow(QMainWindow):
         commands: DeviceCommands | None,
         stats_provider: Callable[[], str] | None = None,
         screenshot_dir: Path | None = None,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._widget = widget
@@ -61,6 +62,7 @@ class MirrorWindow(QMainWindow):
         self._commands = commands
         self._stats_provider = stats_provider
         self._screenshot_dir = screenshot_dir or _default_screenshot_dir()
+        self._on_close = on_close
         self._display_on = True
         #: Size of the last video session we were told about.
         self._video_size: tuple[int, int] = (0, 0)
@@ -337,6 +339,11 @@ class MirrorWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._position_overlay()
+
+    def closeEvent(self, event) -> None:
+        if self._on_close is not None:
+            self._on_close()
+        event.accept()
 
 
 def _default_screenshot_dir() -> Path:
