@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from ..config import SessionConfig
 from ..errors import ConnectionClosed, MirrorScreenError
-from ..protocol.framing import MediaPacket, SessionPacket, VideoDemuxer
+from ..protocol.framing import MediaPacket, SessionPacket, StreamMeta, VideoDemuxer
 from ..protocol.io import SocketByteSource
 from .decoder import VideoDecoder
 from .frame import VideoFrame
@@ -63,15 +63,35 @@ class PipelineStats:
     bytes_received: int = 0
     decode_seconds: float = 0.0
     fps: float = 0.0
-    lag_ms: float = 0.0
     width: int = 0
     height: int = 0
+    #: Time spent blocked waiting for the device to send data. This and
+    #: ``decode_seconds`` are the only latency figures that can be measured on
+    #: one clock, which makes them the trustworthy ones.
+    read_wait_seconds: float = 0.0
+    #: Raw difference between host elapsed time and device timestamp progress.
+    #: Useful only for spotting a runaway queue: it also grows linearly from
+    #: device clock/quantisation drift, so it is not a latency measurement.
+    stream_lag_ms: float = 0.0
 
     @property
     def average_decode_ms(self) -> float:
         if not self.frames:
             return 0.0
         return self.decode_seconds / self.frames * 1000.0
+
+    @property
+    def idle_fraction(self) -> float:
+        """Share of pipeline time spent waiting rather than decoding.
+
+        Near 1.0 means the device cannot feed frames faster than we consume
+        them, so the software is not the bottleneck; a low value means decoding
+        limits the frame rate and delay can accumulate.
+        """
+        total = self.read_wait_seconds + self.decode_seconds
+        if total <= 0:
+            return 0.0
+        return self.read_wait_seconds / total
 
 
 @dataclass(slots=True)
@@ -168,11 +188,19 @@ class VideoPipeline:
     def _consume(self) -> None:
         demuxer = VideoDemuxer(SocketByteSource(self._sock))
 
-        session = demuxer.start()
-        self._apply_session(session, initial=True)
+        meta = demuxer.start()
+        log.info(
+            "stream metadata: %s %dx%d",
+            meta.codec_name or self._config.video_codec,
+            meta.width,
+            meta.height,
+        )
+        self._apply_session(meta, initial=True)
 
         while not self._stop.is_set():
+            read_start = time.perf_counter()
             packet = demuxer.read_packet()
+            self.stats.read_wait_seconds += time.perf_counter() - read_start
 
             if isinstance(packet, SessionPacket):
                 self._apply_session(packet, initial=False)
@@ -192,12 +220,20 @@ class VideoPipeline:
         assert self._decoder is not None
         return self._decoder.decode(packet)
 
-    def _apply_session(self, session: SessionPacket, *, initial: bool) -> None:
+    def _apply_session(self, session: SessionPacket | StreamMeta, *, initial: bool) -> None:
         size = (session.width, session.height)
-        if self._decoder is None:
-            self._decoder = VideoDecoder(
-                self._config.video_codec, session.width, session.height
+        # Prefer the codec the device actually reports over the one we asked
+        # for, so a fallback on the device side cannot desynchronise us.
+        codec = getattr(session, "codec_name", None) or self._config.video_codec
+        if codec != self._config.video_codec:
+            log.warning(
+                "device is streaming %s although %s was requested",
+                codec,
+                self._config.video_codec,
             )
+
+        if self._decoder is None:
+            self._decoder = VideoDecoder(codec, session.width, session.height)
         elif size != self._current_size:
             self._decoder.reset(session.width, session.height)
 
@@ -229,8 +265,11 @@ class VideoPipeline:
             host_delta = (now - self._first_host_time) * 1_000_000
             device_delta = frame.pts_us - self._first_pts_us
             lag_ms = (host_delta - device_delta) / 1000.0
-            # Smooth, and never report negative lag from clock drift.
-            self.stats.lag_ms = max(0.0, 0.8 * self.stats.lag_ms + 0.2 * lag_ms)
+            # Smoothed, clamped at 0 because device clock drift can make this
+            # negative. See PipelineStats.stream_lag_ms for the caveats.
+            self.stats.stream_lag_ms = max(
+                0.0, 0.8 * self.stats.stream_lag_ms + 0.2 * lag_ms
+            )
 
         if len(self._frame_times) >= 2:
             span = self._frame_times[-1] - self._frame_times[0]

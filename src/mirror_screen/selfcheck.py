@@ -19,7 +19,12 @@ from pathlib import Path
 import numpy as np
 
 from .errors import ConnectionClosed, MirrorScreenError
-from .protocol.const import PACKET_FLAG_CONFIG, PACKET_FLAG_KEY_FRAME, PACKET_FLAG_SESSION
+from .protocol.const import (
+    PACKET_FLAG_CONFIG,
+    PACKET_FLAG_KEY_FRAME,
+    PACKET_FLAG_SESSION,
+    VIDEO_CODECS,
+)
 from .protocol.framing import SessionPacket, VideoDemuxer
 from .protocol.io import MemoryByteSource
 from .ui.color import get_conversion
@@ -250,9 +255,16 @@ def media_header(size: int, pts_us: int, *, config: bool = False, key_frame: boo
 
 def build_synthetic_stream(
     segments: list[tuple[int, int, list[tuple[bytes, int, bool]]]],
+    codec: str = "h264",
 ) -> bytes:
-    """Assemble a scrcpy video stream from ``(width, height, packets)`` parts."""
+    """Assemble a scrcpy video stream from ``(width, height, packets)`` parts.
+
+    The stream begins with the codec id, exactly as the server sends it: a real
+    device was observed sending ``68 32 36 34`` ("h264") followed by the first
+    session packet.
+    """
     out = bytearray()
+    out += VIDEO_CODECS[codec].to_bytes(4, "big")
     for width, height, packets in segments:
         out += session_header(width, height)
         config = h264_config_packet(packets[0][0]) if packets else b""
@@ -263,14 +275,20 @@ def build_synthetic_stream(
     return bytes(out)
 
 
-def demux_and_decode(stream: bytes, codec: str = "h264") -> tuple[list[VideoFrame], list[SessionPacket]]:
+def demux_and_decode(
+    stream: bytes, codec: str = "h264"
+) -> tuple[list[VideoFrame], list[SessionPacket], str | None]:
     """Push a synthetic stream through the real demuxer and decoder."""
     demuxer = VideoDemuxer(MemoryByteSource(stream))
-    first = demuxer.start()
+    meta = demuxer.start()
 
-    decoder = VideoDecoder(codec, first.width, first.height)
+    decoder = VideoDecoder(meta.codec_name or codec, meta.width, meta.height)
     frames: list[VideoFrame] = []
-    sessions: list[SessionPacket] = [first]
+    sessions: list[SessionPacket] = [
+        SessionPacket(
+            width=meta.width, height=meta.height, client_resized=meta.client_resized
+        )
+    ]
 
     while True:
         try:
@@ -283,7 +301,7 @@ def demux_and_decode(stream: bytes, codec: str = "h264") -> tuple[list[VideoFram
             continue
         frames.extend(decoder.decode(packet))
 
-    return frames, sessions
+    return frames, sessions, meta.codec_name
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +356,12 @@ def run_self_check(
             (rotated_width, rotated_height, rotated),
         ]
     )
-    frames, sessions = demux_and_decode(stream)
+    frames, sessions, stream_codec = demux_and_decode(stream)
+    report.add(
+        "codec id parsed from the stream",
+        stream_codec == "h264",
+        f"stream reported {stream_codec!r}",
+    )
     seen_sizes = [(session.width, session.height) for session in sessions]
     report.add(
         "session packets parsed",

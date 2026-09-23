@@ -9,6 +9,7 @@ from mirror_screen.protocol.const import DEVICE_NAME_FIELD_LENGTH
 from mirror_screen.protocol.framing import (
     MediaPacket,
     SessionPacket,
+    StreamMeta,
     VideoDemuxer,
     parse_media_header,
     parse_session_header,
@@ -16,7 +17,7 @@ from mirror_screen.protocol.framing import (
 )
 from mirror_screen.protocol.io import MemoryByteSource, SocketByteSource
 
-from .helpers import media_header, session_header
+from .helpers import codec_header, media_header, session_header
 
 
 def test_session_header_layout():
@@ -66,6 +67,7 @@ def test_device_name_is_nul_padded():
 def test_demuxer_reads_a_stream_in_order():
     stream = b"".join(
         [
+            codec_header(),  # stream metadata: codec id, then the session packet
             session_header(1920, 1080),
             media_header(10, config=True) + b"c" * 10,
             media_header(4, pts_us=1000, key_frame=True) + b"aaaa",
@@ -76,9 +78,10 @@ def test_demuxer_reads_a_stream_in_order():
     )
 
     demuxer = VideoDemuxer(MemoryByteSource(stream))
-    first = demuxer.start()
-    assert isinstance(first, SessionPacket)
-    assert (first.width, first.height) == (1920, 1080)
+    meta = demuxer.start()
+    assert isinstance(meta, StreamMeta)
+    assert (meta.width, meta.height) == (1920, 1080)
+    assert meta.codec_name == "h264"
 
     packets = list(demuxer)
     assert isinstance(packets[0], MediaPacket)
@@ -100,11 +103,24 @@ def test_demuxer_reads_a_stream_in_order():
     assert packets[4].payload == b"cc"
 
 
+def test_demuxer_accepts_metadata_without_a_codec_id():
+    """Some servers may emit the session packet without the codec id first."""
+    stream = session_header(1080, 2340) + media_header(1, pts_us=5) + b"x"
+    meta = VideoDemuxer(MemoryByteSource(stream)).start()
+    assert (meta.width, meta.height) == (1080, 2340)
+    assert meta.codec_name is None
+
+
 def test_demuxer_reports_a_version_mismatch_clearly():
-    """scrcpy 2.x sent "codec id, width, height" instead of a session packet."""
-    legacy = (0x68323634).to_bytes(4, "big") + (1080).to_bytes(4, "big") + (
-        1920
-    ).to_bytes(4, "big")
+    """scrcpy 2.x sent "codec id, width, height" with no session packet."""
+    legacy = b"".join(
+        [
+            codec_header(),
+            (1080).to_bytes(4, "big"),
+            (2340).to_bytes(4, "big"),
+            bytes(8),  # padding so the parser can read its 12-byte probe
+        ]
+    )
 
     with pytest.raises(ProtocolError, match="scrcpy 2.x"):
         VideoDemuxer(MemoryByteSource(legacy)).start()
@@ -120,7 +136,12 @@ def test_demuxer_reassembles_split_socket_reads():
     import socket
     import threading
 
-    stream = session_header(640, 480) + media_header(5, pts_us=42) + b"hello"
+    stream = (
+        codec_header()
+        + session_header(640, 480)
+        + media_header(5, pts_us=42)
+        + b"hello"
+    )
     sender, receiver = socket.socketpair()
     try:
 
@@ -132,8 +153,8 @@ def test_demuxer_reassembles_split_socket_reads():
         threading.Thread(target=dribble, daemon=True).start()
 
         demuxer = VideoDemuxer(SocketByteSource(receiver))
-        first = demuxer.start()
-        assert (first.width, first.height) == (640, 480)
+        meta = demuxer.start()
+        assert (meta.width, meta.height) == (640, 480)
 
         packet = demuxer.read_packet()
         assert isinstance(packet, MediaPacket)
@@ -149,7 +170,12 @@ def test_demuxer_reassembles_split_socket_reads():
 
 
 def test_iteration_stops_at_end_of_stream():
-    stream = session_header(640, 480) + media_header(2, pts_us=1) + b"ok"
+    stream = (
+        codec_header()
+        + session_header(640, 480)
+        + media_header(2, pts_us=1)
+        + b"ok"
+    )
     demuxer = VideoDemuxer(MemoryByteSource(stream))
     demuxer.start()
     packets = list(demuxer)

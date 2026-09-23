@@ -38,6 +38,10 @@ class SessionConfig:
     video_bit_rate: int = DEFAULT_VIDEO_BIT_RATE
     audio: bool = False
     control: bool = True
+    force_adb_forward: bool = False
+    """Use an adb *forward* tunnel (client connects) instead of the default
+    reverse tunnel (device connects). Only needed on devices where
+    ``adb reverse`` is unavailable."""
     show_touches: bool = False
     stay_awake: bool = True
     power_on: bool = True

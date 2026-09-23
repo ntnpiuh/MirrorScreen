@@ -33,6 +33,9 @@ VIDEO_CODECS: dict[str, int] = {
     "vp9": CODEC_VP9,
 }
 
+#: Reverse lookup, used to name a codec the device reports on the wire.
+VIDEO_CODEC_NAMES: dict[int, str] = {value: name for name, value in VIDEO_CODECS.items()}
+
 AUDIO_CODECS: dict[str, int] = {
     "opus": CODEC_OPUS,
     "aac": CODEC_AAC,

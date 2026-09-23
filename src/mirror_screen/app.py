@@ -155,8 +155,11 @@ def _status_text(
     parts = [
         f"{stats.width}x{stats.height}",
         f"{stats.fps:.1f} fps",
-        f"lag {stats.lag_ms:.0f} ms",
         f"decode {stats.average_decode_ms:.1f} ms",
+        # Waiting vs working is measured entirely on our own clock, so unlike a
+        # host/device timestamp comparison it cannot drift: it tells you
+        # whether the software is keeping up with the device.
+        f"{stats.idle_fraction * 100:.0f}% idle",
         config.video_codec,
     ]
     if mailbox.overwritten:

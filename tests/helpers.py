@@ -11,6 +11,13 @@ from mirror_screen.protocol.const import (
 )
 
 
+def codec_header(name: str = "h264") -> bytes:
+    """The 4-byte codec id that precedes the first session packet."""
+    from mirror_screen.protocol.const import VIDEO_CODECS
+
+    return VIDEO_CODECS[name].to_bytes(4, "big")
+
+
 def session_header(width: int, height: int, *, client_resized: bool = False) -> bytes:
     """Build a 12-byte session packet."""
     flags = (PACKET_FLAG_SESSION >> 32) | (1 if client_resized else 0)

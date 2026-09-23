@@ -42,6 +42,32 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--force", action="store_true", help="re-download the server")
     setup.set_defaults(func=_cmd_setup)
 
+    probe = subparsers.add_parser(
+        "probe",
+        help="decode from a real device for a few seconds and report",
+    )
+    _add_common_options(probe)
+    _add_video_options(probe)
+    probe.add_argument(
+        "--duration",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="how long to decode for",
+    )
+    probe.add_argument(
+        "--screenshot",
+        type=Path,
+        default=None,
+        help="render the last decoded frame to this PNG",
+    )
+    probe.add_argument(
+        "--no-check-control",
+        action="store_true",
+        help="skip the control-socket round trip check",
+    )
+    probe.set_defaults(func=_cmd_probe)
+
     selftest = subparsers.add_parser(
         "selftest",
         help="verify demuxing, decoding and rendering without a device",
@@ -71,7 +97,12 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     _add_common_options(parser)
+    _add_video_options(parser)
+    _add_window_options(parser)
 
+
+def _add_video_options(parser: argparse.ArgumentParser) -> None:
+    """Options that are forwarded to the on-device server."""
     video = parser.add_argument_group("video (forwarded to the device)")
     video.add_argument(
         "--max-size",
@@ -139,12 +170,20 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
         help="keep the device awake without changing global settings",
     )
     device.add_argument(
+        "--force-adb-forward",
+        action="store_true",
+        help="connect out to the device (adb forward) instead of the default "
+        "reverse tunnel; only needed where 'adb reverse' is unavailable",
+    )
+    device.add_argument(
         "--log-level",
         choices=LOG_LEVELS,
         default="info",
         help="verbosity of the on-device server",
     )
 
+def _add_window_options(parser: argparse.ArgumentParser) -> None:
+    """Options that only affect the client-side window."""
     window = parser.add_argument_group("window")
     window.add_argument("--fullscreen", "-f", action="store_true", help="start fullscreen")
     window.add_argument(
@@ -220,6 +259,7 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         power_on=not getattr(args, "no_power_on", False),
         keep_active=getattr(args, "keep_active", False),
         log_level=getattr(args, "log_level", "info"),
+        force_adb_forward=getattr(args, "force_adb_forward", False),
         fullscreen=getattr(args, "fullscreen", False),
         always_on_top=getattr(args, "always_on_top", False),
         scale=getattr(args, "scale", 1.0),
@@ -274,6 +314,24 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print()
     print("Setup complete. Run 'mirror-screen' to start mirroring.")
     return 0
+
+
+def _cmd_probe(args: argparse.Namespace) -> int:
+    from .probe import run_probe
+
+    config = _config_from_args(args)
+    config.validate()
+
+    result = run_probe(
+        config,
+        duration=args.duration,
+        screenshot=args.screenshot,
+        check_control=not args.no_check_control,
+        progress=lambda message: print(message, file=sys.stderr),
+    )
+    print()
+    print(result.render())
+    return 0 if result.ok else 1
 
 
 def _cmd_selftest(args: argparse.Namespace) -> int:

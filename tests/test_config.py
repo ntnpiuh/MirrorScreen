@@ -132,7 +132,7 @@ def test_cli_version_flag(capsys):
 
 def test_subcommands_are_registered():
     parser = build_parser()
-    for command in ("run", "devices", "setup", "selftest"):
+    for command in ("run", "devices", "setup", "probe", "selftest"):
         args = parser.parse_args([command])
         assert callable(args.func)
 

@@ -1,12 +1,18 @@
 """Demux the video/audio sockets into packets.
 
-Wire format (scrcpy 4.1, verified against ``app/src/demuxer.c`` and
-``server/.../device/Streamer.java``):
+Wire format (scrcpy 4.x, confirmed against a real device):
 
-* The video socket starts with a 12-byte *session packet* describing the
-  current capture size (bytes 4..8 = width, 8..12 = height, byte 3 bit 0 =
-  "client resized"). It is re-sent whenever the capture session restarts,
-  which happens on rotation or folding.
+* The video socket begins with the stream metadata, which is a **4-byte codec
+  id followed by a 12-byte session packet**:
+
+      68 32 36 34   "h264"
+      80 00 00 00   session-packet flag (+ bit 0 = client resized)
+      00 00 04 38   width  (u32, 1080 here)
+      00 00 09 24   height (u32, 2340 here)
+
+  (Both come from ``send_stream_meta=true``.)
+* A session packet is re-sent whenever the capture session restarts, which
+  happens on rotation or folding.
 * Every subsequent packet is prefixed by a 12-byte header::
 
       byte 0..8            byte 8..12
@@ -15,9 +21,9 @@ Wire format (scrcpy 4.1, verified against ``app/src/demuxer.c`` and
   with the flags packed into the top bits of the u64. When the top bit is set
   the packet is a session packet instead, and carries no payload.
 
-Older protocol revisions (scrcpy 2.x) sent a codec id instead of a session
-packet; :meth:`VideoDemuxer.start` detects that shape and reports a clear
-version mismatch rather than misparsing it.
+:meth:`VideoDemuxer.start` accepts the metadata with or without the codec id
+and rejects the scrcpy 2.x shape (codec id, then a bare width/height pair with
+no session flag) with an explicit version-mismatch error.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from .const import (
     PACKET_FLAG_KEY_FRAME,
     PACKET_HEADER_SIZE,
     PACKET_PTS_MASK,
+    VIDEO_CODEC_NAMES,
 )
 from .io import ByteSource, read_u32, read_u64
 
@@ -41,9 +48,17 @@ from .io import ByteSource, read_u32, read_u64
 class StreamMeta:
     """Codec and initial frame size of a stream."""
 
-    codec_id: int
     width: int
     height: int
+    codec_id: int | None = None
+    client_resized: bool = False
+
+    @property
+    def codec_name(self) -> str | None:
+        """The codec as a name (``h264``, ``h265``, ...), if recognised."""
+        if self.codec_id is None:
+            return None
+        return VIDEO_CODEC_NAMES.get(self.codec_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,26 +133,38 @@ class VideoDemuxer:
     def __init__(self, source: ByteSource) -> None:
         self._source = source
         self._session: SessionPacket | None = None
+        #: Codec id reported by the device, if it sent one.
+        self.codec_id: int | None = None
 
-    def start(self) -> SessionPacket:
-        """Consume the stream metadata and return the initial session.
+    def start(self) -> StreamMeta:
+        """Consume the stream metadata and return it.
 
         Raises:
             ProtocolError: if the stream does not start with a session packet,
                 which most likely indicates a server version mismatch.
         """
-        header = self._source.read_exact(PACKET_HEADER_SIZE)
+        # The stream metadata starts with a 4-byte codec id, then a session
+        # packet holding the capture size. Accept a bare session packet too, in
+        # case a server emits the metadata without the codec id.
+        first = self._source.read_exact(4)
+        codec_id: int | None = None
+        if read_u32(first) in VIDEO_CODEC_NAMES:
+            codec_id = read_u32(first)
+            header = self._source.read_exact(PACKET_HEADER_SIZE)
+        else:
+            header = first + self._source.read_exact(PACKET_HEADER_SIZE - 4)
 
         if not is_session_header(header):
-            # scrcpy 2.x sent "codec id (u32), width (u32), height (u32)".
-            codec_id = read_u32(header, 0)
-            width = read_u32(header, 4)
-            height = read_u32(header, 8)
+            # scrcpy 2.x sent "codec id (u32), width (u32), height (u32)" and
+            # had no session packet at all.
+            width = read_u32(header, 0)
+            height = read_u32(header, 4)
             raise ProtocolError(
                 "unexpected video stream metadata: this looks like the "
-                f"scrcpy 2.x protocol (codec=0x{codec_id:08x}, {width}x{height}), "
-                "but Mirror Screen speaks the scrcpy 4.x protocol. The client "
-                "and the on-device server version must match exactly."
+                f"scrcpy 2.x protocol (codec=0x{codec_id or 0:08x}, "
+                f"{width}x{height}), but Mirror Screen speaks the scrcpy 4.x "
+                "protocol. The client and the on-device server version must "
+                "match exactly."
             )
 
         session = parse_session_header(header)
@@ -147,7 +174,13 @@ class VideoDemuxer:
             )
 
         self._session = session
-        return session
+        self.codec_id = codec_id
+        return StreamMeta(
+            width=session.width,
+            height=session.height,
+            codec_id=codec_id,
+            client_resized=session.client_resized,
+        )
 
     def read_packet(self) -> Packet:
         """Read the next packet.

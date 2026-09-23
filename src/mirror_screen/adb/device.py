@@ -94,6 +94,9 @@ class Adb:
         try:
             return subprocess.Popen(
                 cmd,
+                # Never inherit our stdin: a closed or EOF stdin can make the
+                # remote shell tear the command down.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -182,6 +185,16 @@ class Adb:
 
     def forward_remove(self, local_port: int) -> None:
         self.run("forward", "--remove", f"tcp:{local_port}", check=False, timeout=10.0)
+
+    def reverse(self, remote: str, local: str) -> None:
+        """Map a device-side address onto a host-side one.
+
+        The device connects to ``remote``; adb tunnels it to ``local``.
+        """
+        self.run("reverse", remote, local)
+
+    def reverse_remove(self, remote: str) -> None:
+        self.run("reverse", "--remove", remote, check=False, timeout=10.0)
 
     def wait_for_device(self, timeout: float = 30.0) -> None:
         self.run("wait-for-device", timeout=timeout)
