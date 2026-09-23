@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize
 from PySide6.QtGui import (
     QGuiApplication,
     QImage,
@@ -130,10 +130,10 @@ class OffscreenRenderer:
                 integer_scale=integer_scale,
             )
             self._renderer.render(frame, layout, (width, height), conversion)
-            # Reading an FBO back yields rows bottom-up relative to what the
-            # window shows, so mirror it. Without this, screenshots and the
-            # self-check would see an upside-down image.
-            image = _upright(self._fbo.toImage())
+            # toImage() already returns a top-down image, and the renderer now
+            # draws the video upright, so this is exactly what the window shows:
+            # no compensating flip is needed (or wanted) here.
+            image = self._fbo.toImage()
         finally:
             self._fbo.release()
 
@@ -155,14 +155,6 @@ class OffscreenRenderer:
         if not image.save(str(path)):
             raise MirrorScreenError(f"could not write {path}")
         return path
-
-
-def _upright(image: QImage) -> QImage:
-    """Return the image with row 0 at the top of the frame."""
-    try:
-        return image.flipped(Qt.Orientation.Vertical)
-    except (AttributeError, TypeError):  # pragma: no cover - older Qt
-        return image.mirrored(False, True)
 
 
 __all__ = ["OffscreenRenderer"]

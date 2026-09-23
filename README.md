@@ -63,6 +63,23 @@ mirror-screen probe       # decode for 5s and report; no window, proves the setu
 mirror-screen             # start mirroring
 ```
 
+Easiest way to launch it day to day: **double-click `Mirror Screen.command`** in
+Finder. It is a normal shell script, so you can also drag it into a Terminal
+window or pass options to it:
+
+```bash
+./"Mirror Screen.command" --max-size 1280 --no-vsync
+```
+
+From a terminal, the equivalent is:
+
+```bash
+cd ~/projects/app/MirrorScreen
+source .venv/bin/activate     # then just: mirror-screen
+# or without activating:
+.venv/bin/mirror-screen
+```
+
 On the phone: **Settings → About phone → tap Build number 7 times**, then
 **Developer options → USB debugging**, and accept the "Allow USB debugging"
 prompt when you plug it in.
@@ -79,6 +96,7 @@ prompt when you plug it in.
 | `F11` / `Cmd+F` / `Ctrl+F` | toggle full screen |
 | `Esc` | leave full screen (otherwise sent to the device) |
 | `Cmd/Ctrl+R` | rotate the device |
+| `Cmd/Ctrl+0` | refit the window to the video (re-enables auto resizing) |
 | `Cmd/Ctrl+P` | toggle the device screen on/off |
 | `Cmd/Ctrl+V` | send the Mac clipboard to the device and paste |
 | `Cmd/Ctrl+S` | save a full-resolution PNG screenshot |
@@ -108,6 +126,17 @@ mirror-screen --color-matrix bt601 --color-range full
 
 Run `mirror-screen --help` for the full list, including `--codec-option` for
 passing raw `MediaCodec` options such as `profile:1,i-frame-interval:10`.
+
+### Rotation
+
+When the phone rotates (or folds), the capture size changes and the window is
+reshaped to the new aspect ratio **at the same apparent scale** — the picture
+keeps its size and simply turns. If the result would not fit on screen it is
+scaled down to fit, and the window is nudged back inside the display.
+
+Resize the window by hand and it stops doing this, so it never fights you; the
+status bar says so. `Cmd/Ctrl+0` refits it and turns auto resizing back on.
+Use `--no-auto-resize` to disable the behaviour entirely.
 
 ### Where the latency goes
 
@@ -151,6 +180,18 @@ src/mirror_screen/
 ├── selfcheck.py       device-free end-to-end verification
 └── cli.py             command line interface
 ```
+
+### Rendering notes
+
+- **One source of truth for the quad.** The video is drawn as a unit quad whose
+  vertices carry texture coordinates, placed by `quad_transform()` in
+  `ui/geometry.py`. OpenGL's clip space points up while window coordinates point
+  down, so the sign of the y scale decides whether the picture is upright. That
+  sign was wrong once: the image was mirrored on screen while offscreen
+  screenshots looked perfect, because a compensating flip in the framebuffer
+  readback cancelled it out — so the bug was invisible to every automated check.
+  The maths now lives in one place, a test asserts the video's top row lands on
+  the top edge of the layout, and nothing flips the readback.
 
 ### Protocol notes
 
@@ -219,6 +260,8 @@ ok   image is not vertically flipped
 
 Against a Samsung Galaxy A17 (SM-A176B, Android 16) over USB:
 
+Idle home screen:
+
 ```
 video          1080x2340 h264
 frames         447 in 8.0s (58.5 fps)
@@ -229,7 +272,20 @@ stream         3.91 Mbit/s
 control        ok (write acknowledged; the device clipboard now holds ...)
 ```
 
-A screenshot rendered from the live stream matches the phone's screen exactly.
+While playing a 3D game (motion-heavy content, the realistic worst case):
+
+```
+video          2340x1080 h264      (the phone had rotated)
+frames         ~58 fps sustained
+decode         6.15 ms/frame average
+keeping up     68.8% idle (waiting vs decoding)
+throughput     135 MPix/s
+stream         21.79 Mbit/s
+```
+
+Even at peak motion the pipeline is still idle two thirds of the time, so the
+software is not the bottleneck. Screenshots rendered from the live stream match
+the phone's screen exactly, including after a rotation.
 
 ## Known limitations
 

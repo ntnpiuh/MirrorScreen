@@ -26,7 +26,7 @@ from PySide6.QtOpenGL import (
 from ..errors import MirrorScreenError
 from ..video.frame import VideoFrame
 from .color import ColorConversion
-from .geometry import Rect
+from .geometry import Rect, quad_transform
 
 log = logging.getLogger(__name__)
 
@@ -246,12 +246,10 @@ class YuvQuadRenderer:
 
         # Map the unit quad onto ``layout`` in clip space. Clip space has y up
         # while ``layout`` is measured in pixels from the top.
+        # quad_transform keeps scale_y positive: a negative one mirrors the quad
+        # and shows the whole picture upside down.
         program.setUniformValue(
-            "uRect",
-            layout.width * 2.0 / view_width,
-            -layout.height * 2.0 / view_height,
-            layout.center_x * 2.0 / view_width - 1.0,
-            1.0 - layout.center_y * 2.0 / view_height,
+            "uRect", *quad_transform(layout, int(view_width), int(view_height))
         )
         program.setUniformValue("uCol0", QVector3D(*columns[0]))
         program.setUniformValue("uCol1", QVector3D(*columns[1]))

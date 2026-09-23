@@ -13,11 +13,17 @@ from PySide6.QtWidgets import QMainWindow, QMessageBox
 
 from ..config import SessionConfig
 from ..control_channel import ControlChannel
+from .geometry import display_scale, fit_window_to_video
 from .widget import VideoWidget
 
 log = logging.getLogger(__name__)
 
 _STATUS_INTERVAL_MS = 500
+
+#: Fraction of the display a fitted window is allowed to occupy.
+_WINDOW_MARGIN = 0.9
+#: Relative tolerance when deciding whether the user resized the window.
+_SCALE_TOLERANCE = 0.02
 
 
 class MirrorWindow(QMainWindow):
@@ -41,7 +47,12 @@ class MirrorWindow(QMainWindow):
         self._stats_provider = stats_provider
         self._screenshot_dir = screenshot_dir or _default_screenshot_dir()
         self._display_on = True
-        self._fitted_to_video = False
+        #: Size of the last video session we were told about.
+        self._video_size: tuple[int, int] = (0, 0)
+        #: The scale we chose last time, so a rotation can keep the apparent size.
+        self._auto_scale: float | None = None
+        #: Cleared once the user resizes the window by hand.
+        self._auto_resize = config.auto_resize_window
 
         self.setCentralWidget(widget)
         self.setWindowTitle(f"Mirror Screen - {device_name}")
@@ -85,6 +96,7 @@ class MirrorWindow(QMainWindow):
         add("Toggle device screen", ["Ctrl+P", "Meta+P"], self.toggle_display_power)
         add("Paste host clipboard", ["Ctrl+V", "Meta+V"], self.push_clipboard)
         add("Save screenshot", ["Ctrl+S", "Meta+S"], self.save_screenshot)
+        add("Fit window to video", ["Ctrl+0", "Meta+0"], self.fit_window_to_video_now)
         add("Quit", ["Ctrl+Q", "Meta+Q"], self.close)
         self._update_escape_action()
 
@@ -100,8 +112,12 @@ class MirrorWindow(QMainWindow):
             action.setEnabled(self.isFullScreen())
 
     def leave_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
+        if not self.isFullScreen():
+            return
+        self.showNormal()
+        # Coming back from full screen, start from a fresh fit rather than the
+        # scale we happened to have before.
+        self.fit_to_video(*self._video_size, keep_scale=False)
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -143,31 +159,106 @@ class MirrorWindow(QMainWindow):
         log.info("screenshot written to %s", path)
         self.statusBar().showMessage(f"saved {path.name}", 4000)
 
+    # -- window sizing ------------------------------------------------------
     def on_video_session(self, width: int, height: int) -> None:
-        """Fit the window to the video aspect ratio on the first session."""
-        if self._fitted_to_video or self.isFullScreen() or self._config.fullscreen:
+        """Keep the window matched to the video, including on rotation.
+
+        The first session sizes the window to the video. A later session means
+        the capture size changed (the phone rotated or folded), so the window is
+        reshaped to the new aspect ratio while keeping the same apparent scale —
+        the picture stays the same size on screen, it just turns.
+        """
+        previous = self._video_size
+        self._video_size = (width, height)
+
+        if width <= 0 or height <= 0 or not self._auto_resize:
             return
-        if width <= 0 or height <= 0:
-            return
-        screen = QGuiApplication.primaryScreen()
-        if screen is None:
+        if self.isFullScreen() or self._config.fullscreen:
             return
 
-        available = screen.availableGeometry()
-        scale = min(
-            available.width() * 0.9 / width,
-            available.height() * 0.9 / height,
-            1.0,
-        )
-        if scale <= 0:
+        if previous != (0, 0) and not self._still_matches_auto_scale(previous):
+            # The window is no longer the size we chose, so the user resized it
+            # by hand. Stop moving their window; letterbox from here on.
+            self._auto_resize = False
+            self.statusBar().showMessage(
+                "window size left alone because you resized it - press "
+                "Cmd/Ctrl+0 to fit it to the video again",
+                6000,
+            )
             return
 
-        self._fitted_to_video = True
-        chrome = self.statusBar().sizeHint().height()
-        self.resize(
-            max(320, int(width * scale)),
-            max(240, int(height * scale) + chrome),
+        self.fit_to_video(width, height)
+
+    def _still_matches_auto_scale(self, video_size: tuple[int, int]) -> bool:
+        """True if the window is still the size we last chose for it.
+
+        Only a resize that changed the displayed scale counts: widening a window
+        whose height is the limit leaves the picture exactly as it was, so it is
+        not treated as the user taking over the sizing.
+        """
+        if self._auto_scale is None or video_size[0] <= 0 or video_size[1] <= 0:
+            return True
+        current = display_scale(
+            self.width(),
+            self.height(),
+            video_size[0],
+            video_size[1],
+            chrome_height=self._chrome_height(),
         )
+        return abs(current - self._auto_scale) <= _SCALE_TOLERANCE * self._auto_scale
+
+    def _chrome_height(self) -> int:
+        """Height taken by the window frame and status bar."""
+        return self.statusBar().sizeHint().height()
+
+    def available_area(self) -> tuple[int, int]:
+        """Largest window we are willing to use, leaving a margin."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:  # pragma: no cover - no display attached
+            return (1280, 800)
+        area = screen.availableGeometry()
+        return (
+            int(area.width() * _WINDOW_MARGIN),
+            int(area.height() * _WINDOW_MARGIN),
+        )
+
+    def fit_to_video(
+        self, video_width: int, video_height: int, *, keep_scale: bool = True
+    ) -> None:
+        """Resize the window to show the video, optionally keeping the scale."""
+        if video_width <= 0 or video_height <= 0:
+            return
+        max_width, max_height = self.available_area()
+        fit = fit_window_to_video(
+            video_width,
+            video_height,
+            max_width=max_width,
+            max_height=max_height,
+            chrome_height=self._chrome_height(),
+            preferred_scale=self._auto_scale if keep_scale else None,
+        )
+        self._auto_scale = fit.scale
+        self.resize(fit.width, fit.height)
+        self._keep_on_screen()
+
+    def _keep_on_screen(self) -> None:
+        """Nudge the window back inside the display after a resize."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:  # pragma: no cover - no display attached
+            return
+        area = screen.availableGeometry()
+        right = max(area.x() + area.width() - self.width(), area.x())
+        bottom = max(area.y() + area.height() - self.height(), area.y())
+        x = min(max(self.x(), area.x()), right)
+        y = min(max(self.y(), area.y()), bottom)
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+
+    def fit_window_to_video_now(self) -> None:
+        """Re-enable automatic sizing and match the window to the video."""
+        self._auto_resize = True
+        self.fit_to_video(*self._video_size, keep_scale=False)
+        self.statusBar().showMessage("window fitted to the video", 3000)
 
     def set_clipboard_from_device(self, text: str) -> None:
         """Adopt the device clipboard, unless it already matches ours."""

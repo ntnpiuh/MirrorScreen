@@ -111,3 +111,91 @@ def device_point(
     x = int(min(max(dx, 0.0), max(video_width - 1, 0)))
     y = int(min(max(dy, 0.0), max(video_height - 1, 0)))
     return x, y
+
+
+def quad_transform(
+    layout: Rect, view_width: int, view_height: int
+) -> tuple[float, float, float, float]:
+    """Return the ``(scale_x, scale_y, offset_x, offset_y)`` quad placement.
+
+    The drawn quad is a unit square spanning ``[-0.5, 0.5]``, and its vertices
+    carry texture coordinates where ``v = 0`` is the *top* row of the video.
+    OpenGL's clip space points ``y`` upwards while ``layout`` is measured
+    downwards from the top of the window, so the sign of ``scale_y`` is what
+    decides whether the picture is upright:
+
+    * ``scale_y > 0`` — the vertex carrying ``v = 0`` lands in the upper half of
+      the viewport, so the video appears the right way up.
+    * ``scale_y < 0`` — the quad is mirrored, and the video appears **upside
+      down** even though the letterboxing looks correct.
+
+    That second case was a real bug (the image was mirrored on screen while the
+    offscreen screenshots looked fine, because a compensating flip in the
+    readback cancelled it out). Keeping the maths here, with
+    ``tests/test_geometry.py`` asserting the top edge of the video lands exactly
+    on the top edge of ``layout``, is what stops it coming back.
+    """
+    if view_width <= 0 or view_height <= 0:
+        return (1.0, 1.0, 0.0, 0.0)
+    return (
+        layout.width * 2.0 / view_width,
+        layout.height * 2.0 / view_height,
+        layout.center_x * 2.0 / view_width - 1.0,
+        1.0 - layout.center_y * 2.0 / view_height,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WindowFit:
+    """A window size that shows a video at a particular scale."""
+
+    width: int
+    height: int
+    scale: float
+
+
+def display_scale(
+    window_width: int,
+    window_height: int,
+    video_width: int,
+    video_height: int,
+    *,
+    chrome_height: int = 0,
+) -> float:
+    """Recover the scale a window is currently showing a video at."""
+    view_width = max(window_width, 1)
+    view_height = max(window_height - chrome_height, 1)
+    if video_width <= 0 or video_height <= 0:
+        return 1.0
+    return min(view_width / video_width, view_height / video_height)
+
+
+def fit_window_to_video(
+    video_width: int,
+    video_height: int,
+    *,
+    max_width: int,
+    max_height: int,
+    chrome_height: int = 0,
+    preferred_scale: float | None = None,
+    min_width: int = 320,
+    min_height: int = 240,
+) -> WindowFit:
+    """Choose a window size that shows the whole video, chrome included.
+
+    ``preferred_scale`` keeps the apparent size when the video changes shape —
+    which is what makes a rotation resize the window instead of shrinking the
+    picture. ``None`` fits the video into the available area instead. Either
+    way the result never exceeds ``max_width`` x ``max_height``.
+    """
+    if video_width <= 0 or video_height <= 0 or max_width <= 0 or max_height <= 0:
+        return WindowFit(min_width, min_height, 1.0)
+
+    tallest_video = max(max_height - chrome_height, 1)
+    fitted = min(max_width / video_width, tallest_video / video_height)
+    scale = fitted if preferred_scale is None else min(preferred_scale, fitted)
+    scale = max(scale, 0.01)
+
+    width = max(int(round(video_width * scale)), min_width)
+    height = max(int(round(video_height * scale)) + chrome_height, min_height)
+    return WindowFit(width, height, scale)

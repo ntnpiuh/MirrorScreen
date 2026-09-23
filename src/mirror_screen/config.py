@@ -67,6 +67,9 @@ class SessionConfig:
     """Multiplier applied to scroll wheel / trackpad deltas. Negating it
     reverses the scroll direction."""
     show_stats: bool = True
+    auto_resize_window: bool = True
+    """Reshape the window to the video when the device rotates. Turned off
+    automatically once the window is resized by hand."""
     vsync: bool = True
     """Wait for the display refresh between frames. Disabling it removes up to
     one refresh interval of latency at the cost of possible tearing."""

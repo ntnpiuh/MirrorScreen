@@ -214,6 +214,11 @@ def _add_window_options(parser: argparse.ArgumentParser) -> None:
         "--no-stats", action="store_true", help="hide the live statistics"
     )
     window.add_argument(
+        "--no-auto-resize",
+        action="store_true",
+        help="do not reshape the window when the device rotates",
+    )
+    window.add_argument(
         "--color-matrix",
         choices=["auto", "bt601", "bt709"],
         default="auto",
@@ -267,6 +272,7 @@ def _config_from_args(args: argparse.Namespace) -> SessionConfig:
         filter_mode="nearest" if getattr(args, "nearest", False) else "linear",
         vsync=not getattr(args, "no_vsync", False),
         show_stats=not getattr(args, "no_stats", False),
+        auto_resize_window=not getattr(args, "no_auto_resize", False),
         color_matrix=getattr(args, "color_matrix", "auto"),
         color_range=getattr(args, "color_range", "auto"),
         scroll_scale=getattr(args, "scroll_scale", 1.0),
