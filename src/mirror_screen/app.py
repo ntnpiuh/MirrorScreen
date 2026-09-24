@@ -204,15 +204,19 @@ class SessionRunner(QObject):
             self._server = server
             self._device_name = session.device_name
 
-            if session.control is not None:
+            control_socket = session.control
+            if control_socket is not None:
                 channel = ControlChannel(
-                    session.control,
+                    control_socket,
                     on_clipboard=self.clipboard_received.emit,
                 )
                 channel.start()
 
+            video_socket = session.video
+            if video_socket is None:
+                raise MirrorScreenError("server did not provide a video socket")
             pipeline = VideoPipeline(
-                session.video,
+                video_socket,
                 config,
                 self._mailbox,
                 PipelineCallbacks(
@@ -424,7 +428,13 @@ def start_device_session(
 
 def _run_gui(config: SessionConfig, *, progress=None) -> int:
     configure_surface_format(vsync=config.vsync)
-    app = QApplication.instance() or QApplication(sys.argv[:1])
+    existing_app = QApplication.instance()
+    if existing_app is None:
+        app = QApplication(sys.argv[:1])
+    elif isinstance(existing_app, QApplication):
+        app = existing_app
+    else:
+        raise RuntimeError("a non-GUI Qt application is already running")
     app.setApplicationName("Mirror Screen")
     app.setApplicationDisplayName("Mirror Screen")
     # The settings dialog is accepted (and hidden) before adb/server resource
@@ -468,34 +478,48 @@ def _run_gui(config: SessionConfig, *, progress=None) -> int:
     def open_stream(adb_path: Path, jar: Path) -> None:
         nonlocal mailbox, runner, window, widget, failure_bridge, tracer
         selected = control.build_config()
-        mailbox = FrameMailbox()
-        runner = SessionRunner(selected, mailbox, adb_path=adb_path, jar=jar)
-        widget = VideoWidget(selected, mailbox, runner.send_control)
-        window = MirrorWindow(
-            widget,
+        active_mailbox = FrameMailbox()
+        active_runner = SessionRunner(
+            selected, active_mailbox, adb_path=adb_path, jar=jar
+        )
+        active_widget = VideoWidget(selected, active_mailbox, active_runner.send_control)
+        active_window = MirrorWindow(
+            active_widget,
             selected,
             device_name="connecting",
-            commands=runner,
-            stats_provider=lambda: _status_text(runner, mailbox, selected, widget),
+            commands=active_runner,
+            stats_provider=lambda: _status_text(
+                active_runner, active_mailbox, selected, active_widget
+            ),
             on_close=stream_closed,
         )
-        runner.frame_ready.connect(widget.refresh)
-        runner.device_ready.connect(lambda name: window.setWindowTitle(f"Mirror Screen - {name}"))
-        runner.session_changed.connect(widget.set_video_size)
-        runner.session_changed.connect(window.on_video_session)
-        runner.stream_state.connect(window.show_overlay)
-        runner.stream_message.connect(window.statusBar().showMessage)
-        runner.clipboard_received.connect(window.set_clipboard_from_device)
+        mailbox = active_mailbox
+        runner = active_runner
+        widget = active_widget
+        window = active_window
+        active_runner.frame_ready.connect(active_widget.refresh)
+        active_runner.device_ready.connect(
+            lambda name: active_window.setWindowTitle(f"Mirror Screen - {name}")
+        )
+        active_runner.session_changed.connect(active_widget.set_video_size)
+        active_runner.session_changed.connect(active_window.on_video_session)
+        active_runner.stream_state.connect(active_window.show_overlay)
+        active_runner.stream_message.connect(active_window.statusBar().showMessage)
+        active_runner.clipboard_received.connect(
+            active_window.set_clipboard_from_device
+        )
         if failure_bridge is None:
             failure_bridge = _GuiCallback(startup_failed, app)
-        runner.startup_failed.connect(failure_bridge.call)
-        window.resize(*_DEFAULT_WINDOW)
+        active_runner.startup_failed.connect(failure_bridge.call)
+        active_window.resize(*_DEFAULT_WINDOW)
         control.hide()
-        window.show()
-        runner.start_async()
+        active_window.show()
+        active_runner.start_async()
         if tracer is not None:
             tracer.stop()
-        tracer = _install_tracer(selected, app, runner, mailbox, widget)
+        tracer = _install_tracer(
+            selected, app, active_runner, active_mailbox, active_widget
+        )
 
     def _stop_tracer() -> None:
         nonlocal tracer
@@ -649,7 +673,7 @@ def _install_tracer(
     timer.timeout.connect(_log)
     timer.start()
     # Keep a reference alive on the application object.
-    app._mirror_screen_tracer = timer
+    setattr(app, "_mirror_screen_tracer", timer)
     return timer
 
 
@@ -665,7 +689,7 @@ def _install_sigint_handler(app: QApplication) -> None:
     timer = QTimer(app)
     timer.start(200)
     timer.timeout.connect(lambda: None)
-    app._mirror_screen_signal_timer = timer  # keep a reference alive
+    setattr(app, "_mirror_screen_signal_timer", timer)
 
 
 __all__ = [

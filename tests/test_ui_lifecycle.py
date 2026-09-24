@@ -27,6 +27,8 @@ from mirror_screen.ui.window import MirrorWindow
 app = QApplication.instance() or QApplication([])
 closed = []
 widget = QWidget()
+
+# Test 1: Stream window close notifies session owner
 window = MirrorWindow(
     widget,
     SessionConfig(),
@@ -34,12 +36,10 @@ window = MirrorWindow(
     commands=None,
     on_close=lambda: closed.append(True),
 )
-
 window.close()
 app.processEvents()
-
 assert closed == [True], closed
-print("OK")
+print("OK - Stream window close notified owner")
 """
 
 
@@ -55,4 +55,4 @@ def test_stream_window_close_notifies_session_owner():
         f"widget lifecycle check exited with {result.returncode}:\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "OK" in result.stdout
+    assert "OK - Stream window close notified owner" in result.stdout

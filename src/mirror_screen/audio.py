@@ -9,9 +9,10 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 import av
+from av.error import FFmpegError
 
 from .errors import ConnectionClosed, DecodeError, MirrorScreenError
 from .protocol.const import AUDIO_CODEC_NAMES, FFMPEG_DECODERS
@@ -19,6 +20,14 @@ from .protocol.framing import AudioDemuxer, MediaPacket
 from .protocol.io import SocketByteSource
 
 log = logging.getLogger(__name__)
+
+
+class _AudioCodecContext(Protocol):
+    """The decoder API used here, including methods absent from PyAV stubs."""
+
+    extradata: bytes | None
+
+    def decode(self, packet: av.Packet) -> list[av.AudioFrame]: ...
 
 
 class AudioError(MirrorScreenError):
@@ -148,11 +157,12 @@ class AudioDecoder:
             # SPS/PPS from its own config packets.
             try:
                 self._ensure_context().extradata = packet.payload
-            except av.AVError as exc:
+            except FFmpegError as exc:
                 raise DecodeError(f"could not apply audio codec config: {exc}") from exc
             return []
         try:
-            frames = self._ensure_context().decode(av.Packet(packet.payload))
+            decoder = cast(_AudioCodecContext, self._ensure_context())
+            frames = decoder.decode(av.Packet(packet.payload))
             chunks: list[AudioChunk] = []
             for frame in frames:
                 for converted in self._ensure_resampler().resample(frame):
@@ -165,7 +175,7 @@ class AudioDecoder:
                         )
                     )
             return chunks
-        except av.AVError as exc:
+        except FFmpegError as exc:
             raise DecodeError(f"audio decode failed: {exc}") from exc
 
     def close(self) -> None:
