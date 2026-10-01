@@ -81,7 +81,7 @@ jobs:
         run: |
           test "$(find release-assets -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 3
           ls -lh release-assets
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: Mirror Screen ${{ github.ref_name }}
